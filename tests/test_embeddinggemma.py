@@ -7,6 +7,7 @@ onnxruntime.InferenceSession to keep CI fast and network-free.
 Skipped when the multilingual extra isn't installed (huggingface_hub/
 tokenizers/numpy) — CI runs only core deps by default.
 """
+
 import sys
 
 import pytest
@@ -192,7 +193,9 @@ def test_cache_key_separates_models(monkeypatch):
     ml_again = embedding.get_embedding_function(device="cpu", model="minilm")
 
     assert ml is ml_again, "minilm should cache-hit on second call"
-    assert isinstance(eg, embedding.EmbeddinggemmaONNX), "embeddinggemma should not collide with minilm cache"
+    assert isinstance(eg, embedding.EmbeddinggemmaONNX), (
+        "embeddinggemma should not collide with minilm cache"
+    )
     assert ml is not eg
 
 

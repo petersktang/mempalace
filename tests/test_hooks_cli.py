@@ -31,6 +31,39 @@ from mempalace.hooks_cli import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_existing_palace_root(monkeypatch, tmp_path):
+    """Give every test an isolated, *existing* PALACE_ROOT/STATE_DIR.
+
+    Regression for #1510: nine save / log / precompact tests assumed
+    ``~/.mempalace`` existed and only passed in the full suite because an
+    earlier test file (``test_cli.py``) created it as a side effect, so
+    the ``_palace_root_exists()`` kill-switch was satisfied. Run in
+    isolation they short-circuited and failed.
+
+    Defaulting every test to a per-test palace root that exists makes
+    them robust on their own and protects future tests from the same
+    trap. ``_MINE_PID_DIR`` is patched too: it is derived from
+    ``STATE_DIR`` *at module import* (hooks_cli.py:277), so patching
+    ``STATE_DIR`` alone would leave mine-spawning tests writing PID files
+    under the import-time location instead of the per-test root. The
+    state dir is created so the docstring's "existing" promise holds.
+
+    Tests that exercise the absent-root kill-switch path call
+    ``_redirect_palace_root`` (or set their own PALACE_ROOT) *after* this
+    fixture; ``monkeypatch``'s last-write-wins means they keep their
+    absent/file root and teardown still restores the real module value.
+    """
+    root = tmp_path / ".mempalace"
+    state_dir = root / "hook_state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", root)
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", state_dir)
+    monkeypatch.setattr(hooks_cli_mod, "_MINE_PID_DIR", state_dir / "mine_pids")
+    monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    return root
+
+
 # --- _mempalace_python ---
 
 
@@ -328,21 +361,171 @@ def test_wing_from_transcript_path_lowercases():
 
 
 def test_wing_from_transcript_path_non_projects_layout():
-    # Linux users with code under ~/dev/, ~/src/, ~/code/ — no -Projects- segment.
-    # Project name is the final dash-separated token of the encoded folder.
+    # Linux user with code under ~/dev/. The encoded form ``dev-MemPalace-mempalace``
+    # is ambiguous between ``~/dev/MemPalace/mempalace/`` (project = mempalace) and
+    # ``~/dev/MemPalace-mempalace/`` (hyphenated single-name project). With no JSONL
+    # cwd to disambiguate, we preserve all post-``dev-`` segments rather than silently
+    # truncating to the last token (which would drop ``MemPalace`` here and collide
+    # with any other ``-mempalace`` leaf elsewhere on the system).
     path = "/home/igor/.claude/projects/-home-igor-dev-MemPalace-mempalace/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_mempalace"
+    assert _wing_from_transcript_path(path) == "wing_mempalace_mempalace"
 
 
 def test_wing_from_transcript_path_macos_users_layout():
-    # macOS ~/ layout without a Projects/ segment.
+    # macOS ~/ layout without a Projects/ segment — single-token project name
+    # so the heuristic produces the same result as the leaf-only approach.
     path = "/Users/alice/.claude/projects/-Users-alice-code-MyApp/session.jsonl"
     assert _wing_from_transcript_path(path) == "wing_myapp"
 
 
 def test_wing_from_transcript_path_nested_deep():
+    # Deep tree: ``-home-bob-work-clients-acme-frontend``. Without JSONL cwd we
+    # can't tell whether ``frontend`` is the project, ``acme-frontend`` is a
+    # hyphenated project, or the project lives several levels in. Strip the
+    # user-home and one common parent (``work-``), then keep the remaining
+    # path as the wing — collision-safe even if multiple clients have a
+    # ``frontend/`` subdir.
     path = "/home/bob/.claude/projects/-home-bob-work-clients-acme-frontend/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_frontend"
+    assert _wing_from_transcript_path(path) == "wing_clients_acme_frontend"
+
+
+# --- _wing_from_transcript_path: hyphenated project names (issue #1410) ---
+
+
+def test_wing_from_transcript_path_hyphenated_claude_code():
+    """Regression: ``claude-code`` was truncated to ``wing_code`` (#1410)."""
+    path = "/Users/me/.claude/projects/-Users-me-claude-code/abc.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_claude_code"
+
+
+def test_wing_from_transcript_path_hyphenated_react_native():
+    """Regression: ``react-native`` was truncated to ``wing_native`` (#1410)."""
+    path = "/Users/me/.claude/projects/-Users-me-react-native/abc.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_react_native"
+
+
+def test_wing_from_transcript_path_no_collision_between_hyphenated_siblings():
+    """Regression: ``customer-portal`` and ``admin-portal`` both truncated to
+    ``wing_portal`` under the old heuristic, merging diary entries from two
+    independent projects into one wing (#1410)."""
+    customer = _wing_from_transcript_path(
+        "/Users/me/.claude/projects/-Users-me-customer-portal/abc.jsonl"
+    )
+    admin = _wing_from_transcript_path(
+        "/Users/me/.claude/projects/-Users-me-admin-portal/abc.jsonl"
+    )
+    assert customer == "wing_customer_portal"
+    assert admin == "wing_admin_portal"
+    assert customer != admin
+
+
+def test_wing_from_transcript_path_strips_parent_dir_with_hyphenated_project():
+    """Reporter's example: ``-home-alice-projects-react-native`` should keep
+    the full project name after stripping the ``projects-`` parent (#1410)."""
+    path = "/home/alice/.claude/projects/-home-alice-projects-react-native/abc.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_react_native"
+
+
+# --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
+
+
+def test_wing_from_transcript_path_uses_cwd_from_jsonl(tmp_path):
+    """When the JSONL records ``cwd``, the leaf segment of cwd is the wing —
+    even if the encoded folder name would have produced a different (and
+    noisier) wing."""
+    # Encoded folder says ``-home-igor-dev-MemPalace-mempalace`` (would yield
+    # ``wing_mempalace_mempalace`` via fallback), but cwd is the truth.
+    project_dir = tmp_path / "-home-igor-dev-MemPalace-mempalace"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"queue-operation","operation":"enqueue","timestamp":"2026-05-09T00:00:00Z"}\n'
+        '{"type":"user","cwd":"/home/igor/dev/MemPalace/mempalace","content":"hi"}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "wing_mempalace"
+
+
+def test_wing_from_transcript_path_cwd_with_hyphenated_project(tmp_path):
+    """cwd primary path correctly handles hyphenated project names without
+    truncation."""
+    project_dir = tmp_path / "-Users-me-claude-code"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","cwd":"/Users/me/git/claude-code","content":"hi"}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "wing_claude_code"
+
+
+def test_wing_from_transcript_path_cwd_skips_lines_without_cwd(tmp_path):
+    """Lines that lack ``cwd`` (queue-operation, etc.) are skipped; the first
+    line that records cwd wins."""
+    project_dir = tmp_path / "-Users-me-foo"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    lines = [
+        '{"type":"queue-operation","operation":"enqueue"}',
+        '{"type":"queue-operation","operation":"dequeue"}',
+        '{"type":"queue-operation","operation":"complete"}',
+        '{"type":"tool_use","cwd":"/Users/me/work/real-project","content":"ok"}',
+        '{"type":"user","cwd":"/Users/me/somewhere-else","content":"later"}',
+    ]
+    transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # First cwd record wins (line 4, real-project).
+    assert _wing_from_transcript_path(str(transcript)) == "wing_real_project"
+
+
+def test_wing_from_transcript_path_cwd_falls_back_when_no_cwd_in_jsonl(tmp_path):
+    """If no JSONL line has cwd, fall through to the encoded-folder heuristic."""
+    project_dir = tmp_path / "-Users-me-no-cwd-project"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"queue-operation","operation":"enqueue"}\n'
+        '{"type":"queue-operation","operation":"complete"}\n',
+        encoding="utf-8",
+    )
+    # tmp_path leaks into the path before .claude/projects, so the regex
+    # won't match and we hit the wing_sessions default. The point of this
+    # test: the cwd reader doesn't crash and returns None cleanly.
+    result = _wing_from_transcript_path(str(transcript))
+    assert result == "wing_sessions"
+
+
+def test_wing_from_transcript_path_cwd_handles_malformed_jsonl(tmp_path):
+    """Malformed JSON lines must not crash the wing extraction."""
+    project_dir = tmp_path / "-Users-me-broken-project"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        "this is not json at all\n"
+        '{"type":"broken",\n'  # truncated mid-record
+        '{"type":"valid","cwd":"/Users/me/git/clean-name","content":"ok"}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "wing_clean_name"
+
+
+def test_wing_from_transcript_path_cwd_handles_missing_file():
+    """Nonexistent transcript path falls back cleanly to the encoded heuristic."""
+    path = "/Users/me/.claude/projects/-Users-me-claude-code/does-not-exist.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_claude_code"
+
+
+def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
+    """A cwd field that isn't a string (e.g. null, number) must be skipped."""
+    project_dir = tmp_path / "-Users-me-fallback-name"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"x","cwd":null}\n'
+        '{"type":"x","cwd":42}\n'
+        '{"type":"x","cwd":"/Users/me/git/proper-name"}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "wing_proper_name"
 
 
 # --- _log ---
@@ -700,9 +883,9 @@ def test_spawn_mine_releases_slot_on_oserror(tmp_path):
             with patch("mempalace.hooks_cli.subprocess.Popen", side_effect=OSError("spawn fail")):
                 with pytest.raises(OSError):
                     _spawn_mine(cmd)
-                assert (
-                    not pid_file.exists()
-                ), "slot must be released so the next hook fire isn't permanently blocked"
+                assert not pid_file.exists(), (
+                    "slot must be released so the next hook fire isn't permanently blocked"
+                )
 
 
 def test_spawn_mine_passes_pid_file_env_var(tmp_path):

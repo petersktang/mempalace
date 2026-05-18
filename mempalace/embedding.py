@@ -159,7 +159,9 @@ class EmbeddinggemmaONNX:
         return "embeddinggemma_300m"
 
     def __init__(self, preferred_providers=None):
-        self._providers = list(preferred_providers) if preferred_providers else ["CPUExecutionProvider"]
+        self._providers = (
+            list(preferred_providers) if preferred_providers else ["CPUExecutionProvider"]
+        )
         self._session = None
         self._tokenizer = None
         self._np = None
@@ -181,15 +183,23 @@ class EmbeddinggemmaONNX:
                 "Reinstall with: pip install --upgrade --force-reinstall mempalace"
             ) from e
 
-        logger.info("Downloading %s/%s (cached after first run)…", _EMBEDDINGGEMMA_REPO, _EMBEDDINGGEMMA_ONNX)
-        model_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX)
+        logger.info(
+            "Downloading %s/%s (cached after first run)…",
+            _EMBEDDINGGEMMA_REPO,
+            _EMBEDDINGGEMMA_ONNX,
+        )
+        model_path = hf_hub_download(
+            _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX
+        )
         tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
 
         self._session = ort.InferenceSession(model_path, providers=self._providers)
         out_names = [o.name for o in self._session.get_outputs()]
         # Model card: sentence_embedding is the pooled output (last_hidden_state
         # is the per-token output we don't want).
-        self._output_idx = out_names.index("sentence_embedding") if "sentence_embedding" in out_names else 1
+        self._output_idx = (
+            out_names.index("sentence_embedding") if "sentence_embedding" in out_names else 1
+        )
 
         tokenizer = Tokenizer.from_file(tok_path)
         tokenizer.enable_padding()
@@ -204,7 +214,9 @@ class EmbeddinggemmaONNX:
         encs = self._tokenizer.encode_batch(texts)
         input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
         attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
-        outputs = self._session.run(None, {"input_ids": input_ids, "attention_mask": attention_mask})
+        outputs = self._session.run(
+            None, {"input_ids": input_ids, "attention_mask": attention_mask}
+        )
         sent_emb = outputs[self._output_idx][:, :_EMBEDDINGGEMMA_DIM]
         # L2-normalize so cosine similarity == dot product (matches what the
         # MTEB methodology assumes; ChromaDB's distance is configured for it).
@@ -243,7 +255,12 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         ef = ef_cls(preferred_providers=providers)
 
     _EF_CACHE[cache_key] = ef
-    logger.info("Embedding function initialized (model=%s device=%s providers=%s)", model, effective, providers)
+    logger.info(
+        "Embedding function initialized (model=%s device=%s providers=%s)",
+        model,
+        effective,
+        providers,
+    )
     return ef
 
 
