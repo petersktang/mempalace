@@ -785,7 +785,11 @@ def _extract_entities_for_metadata(content: str) -> str:
 
     known = _load_known_entities()
     for name in known:
-        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content):
+        # Case-insensitive match — mirrors entity_detector.py's init-time
+        # behavior so a known entity like "Aya" tags drawers that mention
+        # "aya" / "AYA" / "Aya". Without re.IGNORECASE, lowercase mentions
+        # in chat transcripts and voice-typed content get silently untagged.
+        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content, re.IGNORECASE):
             matched.add(name)
 
     from .palace import _candidate_entity_words

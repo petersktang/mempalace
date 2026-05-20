@@ -340,6 +340,40 @@ def test_entity_metadata_finds_cyrillic_names(monkeypatch):
     assert "Михаил" in result, f"Cyrillic name not found in entity metadata: {result!r}"
 
 
+def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
+    """Per-drawer entity tagging must mirror init-time case-insensitive matching.
+
+    The init-time scanner in entity_detector.py already does case-insensitive
+    matching against the corpus (line 276: ``name_line_indices = [...if name_lower
+    in line.lower()...]``). The per-drawer tagger in miner.py:788 was not
+    updated to use the same flag — so an entry like ``"Aya"`` in
+    known_entities.json fails to match the lowercase mention ``aya`` that
+    appears in chat transcripts, voice-typed notes, and journal-style
+    drawers. This test pins down the contract: known-entity names must match
+    the content case-insensitively.
+    """
+    from mempalace import miner
+
+    # Stub the known-entity registry to a controlled set
+    monkeypatch.setattr(miner, "_load_known_entities", lambda: frozenset({"Aya", "Lumi"}))
+
+    # Lowercase mentions of seeded names must still be tagged.
+    result = miner._extract_entities_for_metadata("aya talked to lumi today about the palace.")
+    matched = set(result.split(";")) if result else set()
+    assert "Aya" in matched, (
+        f"lowercase 'aya' must match the seeded 'Aya' (case-insensitive). Got: {matched!r}"
+    )
+    assert "Lumi" in matched, (
+        f"lowercase 'lumi' must match the seeded 'Lumi' (case-insensitive). Got: {matched!r}"
+    )
+
+    # Mixed case must also match
+    result_mixed = miner._extract_entities_for_metadata("Aya saw lumi. AYA waved.")
+    matched_mixed = set(result_mixed.split(";")) if result_mixed else set()
+    assert "Aya" in matched_mixed
+    assert "Lumi" in matched_mixed
+
+
 def test_file_already_mined_check_mtime():
     tmpdir = tempfile.mkdtemp()
     try:
