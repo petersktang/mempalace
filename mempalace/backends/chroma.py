@@ -1389,7 +1389,11 @@ class ChromaBackend(BaseBackend):
             # path); an mtime/appearance change means an external in-place
             # write (closet_llm, mine, compress) that may have drifted the
             # HNSW index while this process was running.
-            if inode_changed or mtime_changed or mtime_appeared:
+            if (
+                inode_changed
+                or mtime_changed
+                or (mtime_appeared and palace_path in self._freshness)
+            ):
                 ChromaBackend._quarantined_paths.discard(palace_path)
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
