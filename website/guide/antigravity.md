@@ -138,6 +138,49 @@ becomes a no-op without removing the plugin.
   emits `{}` and the conversation starts without injection rather
   than blocking the user.
 
+## How the hooks find your `mempalace` install
+
+The hooks run `mempalace` as `python -m mempalace`, so they need a
+Python interpreter that can actually import the package. In almost
+every case this is resolved **automatically** — you should not need to
+configure anything. The resolution order is:
+
+1. **`MEMPAL_PYTHON`** — an explicit interpreter path you export
+   (escape hatch; see below).
+2. **The `mempalace-mcp` / `mempalace` console-script shebang.** When
+   you install via `uv tool install mempalace` or `pipx install`, the
+   package lives in an *isolated* environment whose interpreter is
+   **not** your system `python3`. The hooks read the shebang line of
+   the console script already on your `PATH` (the same one the MCP
+   server launches) to find that exact interpreter. This is what makes
+   the common install paths work with zero configuration.
+3. **`python3` on `PATH`** — covers an activated virtualenv or an
+   editable (`pip install -e .`) dev checkout.
+4. A bare `python3` fallback.
+
+### When you might need `MEMPAL_PYTHON`
+
+You only need to set it if the hooks can't otherwise reach a Python
+with `mempalace` importable — for example, an unusual install layout,
+or a wrapper interpreter the shebang heuristic can't follow. Point it
+at the interpreter that owns the package:
+
+```bash
+# uv tool install: the interpreter lives under `uv tool dir`
+export MEMPAL_PYTHON="$(uv tool dir)/mempalace/bin/python"
+
+# or a project virtualenv
+export MEMPAL_PYTHON=/path/to/.venv/bin/python
+```
+
+Add the line to your `~/.zshrc` / `~/.bashrc` so a GUI-launched
+Antigravity (which may not inherit your interactive shell `PATH`)
+picks it up. Verify with:
+
+```bash
+"$MEMPAL_PYTHON" -m mempalace --version
+```
+
 ## Verifying installation
 
 ```bash
@@ -195,9 +238,23 @@ Verify `~/.gemini/config/plugins/mempalace/hooks.json` exists and the
 
 ### Save fires but no mining happens
 
-Mining only triggers when `count % MEMPAL_SAVE_INTERVAL == 0`. The
-log shows the running counter and interval per fire — wait for the
-next save tick or set `MEMPAL_SAVE_INTERVAL=1` for testing.
+Two common causes:
+
+1. **The interval hasn't elapsed.** Mining only triggers when
+   `count % MEMPAL_SAVE_INTERVAL == 0`. The log shows the running
+   counter and interval per fire — wait for the next save tick or set
+   `MEMPAL_SAVE_INTERVAL=1` for testing.
+2. **The resolved Python can't import `mempalace`.** Look for this
+   line in `~/.mempalace/hook_state/antigravity_hook.log`:
+
+   ```
+   ERROR: mempalace is not runnable via <python> -m mempalace; install mempalace or set MEMPAL_PYTHON
+   ```
+
+   If you see it, the interpreter resolution (see *How the hooks find
+   your `mempalace` install* above) landed on a Python without the
+   package. Set `MEMPAL_PYTHON` to the correct interpreter and restart
+   Antigravity.
 
 ### Wake injection isn't appearing
 

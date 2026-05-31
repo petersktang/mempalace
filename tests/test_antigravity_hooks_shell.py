@@ -1121,3 +1121,175 @@ def test_gc_does_not_run_under_kill_switch(tmp_path: Path) -> None:
     assert not (state / "antigravity_last_sweep").exists(), (
         "GC ran despite the kill switch being tripped"
     )
+
+
+# ── Python interpreter resolution (mempal_resolve_python) ─────────────
+#
+# The hooks run `"$MEMPAL_PYTHON_BIN" -m mempalace`, so MEMPAL_PYTHON_BIN
+# must resolve to an interpreter that owns the mempalace package. The
+# common install path — `uv tool install mempalace` / `pipx install` —
+# puts the console scripts on PATH inside an ISOLATED env whose
+# interpreter is NOT system python3. The resolver derives that
+# interpreter from the console-script shebang so mining works without
+# the user having to set MEMPAL_PYTHON. Regression coverage for the
+# silent-skip bug a real user hit on PR #1633.
+
+
+def _resolve_python(env: dict[str, str]) -> str:
+    """Source common.sh under ``env`` and return the resolved MEMPAL_PYTHON_BIN."""
+    out = subprocess.run(
+        ["bash", "-c", f'. {COMMON_LIB}; printf "%s" "$MEMPAL_PYTHON_BIN"'],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip()
+
+
+def _make_fake_python(path: Path) -> Path:
+    """Create an executable file whose basename looks like a Python interpreter."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\necho fake-python\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _make_console_script(path: Path, shebang_interp: str) -> Path:
+    """Create a fake mempalace console script with the given shebang interpreter."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!{shebang_interp}\nprint('hi')\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_resolve_python_derives_interpreter_from_console_script_shebang(
+    tmp_path: Path,
+) -> None:
+    """With MEMPAL_PYTHON unset, the resolver reads the mempalace-mcp shebang.
+
+    Simulates a `uv tool install` layout: the console script is on PATH
+    but its interpreter is an isolated Python, NOT the system python3
+    that PATH would otherwise resolve.
+    """
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    interp = _make_fake_python(tmp_path / "pyhome" / "python3.12")
+    bindir = tmp_path / "bin"
+    _make_console_script(bindir / "mempalace-mcp", str(interp))
+
+    env = {**os.environ, "HOME": str(home), "PATH": f"{bindir}:/usr/bin:/bin"}
+    env.pop("MEMPAL_PYTHON", None)
+
+    assert _resolve_python(env) == str(interp), (
+        "resolver should derive the interpreter from the mempalace-mcp "
+        "console-script shebang when MEMPAL_PYTHON is unset"
+    )
+
+
+def test_resolve_python_prefers_mcp_script_over_path_python3(tmp_path: Path) -> None:
+    """The shebang-derived interpreter must win over a system python3 on PATH.
+
+    This is the crux of the fix: a system python3 is present (and would
+    be picked by the old resolver) but lacks the package, while the
+    console script's interpreter owns it.
+    """
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    interp = _make_fake_python(tmp_path / "pyhome" / "python3.12")
+    bindir = tmp_path / "bin"
+    _make_console_script(bindir / "mempalace-mcp", str(interp))
+    # A decoy python3 earlier on PATH must be ignored in favour of the shebang.
+    _make_fake_python(bindir / "python3")
+
+    env = {**os.environ, "HOME": str(home), "PATH": f"{bindir}:/usr/bin:/bin"}
+    env.pop("MEMPAL_PYTHON", None)
+
+    assert _resolve_python(env) == str(interp), (
+        "shebang-derived interpreter must take precedence over a python3 on PATH"
+    )
+
+
+def test_resolve_python_override_beats_shebang(tmp_path: Path) -> None:
+    """An explicit MEMPAL_PYTHON override always wins over shebang derivation."""
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    override = _make_fake_python(tmp_path / "override" / "python3")
+    interp = _make_fake_python(tmp_path / "pyhome" / "python3.12")
+    bindir = tmp_path / "bin"
+    _make_console_script(bindir / "mempalace-mcp", str(interp))
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bindir}:/usr/bin:/bin",
+        "MEMPAL_PYTHON": str(override),
+    }
+    assert _resolve_python(env) == str(override), (
+        "MEMPAL_PYTHON override must take precedence over the console-script shebang"
+    )
+
+
+def test_resolve_python_rejects_env_style_shebang(tmp_path: Path) -> None:
+    """A `#!/usr/bin/env python3` wrapper must be skipped, not used verbatim.
+
+    The first shebang token would be `/usr/bin/env`, which is not a
+    Python interpreter. The resolver must reject it (basename guard) and
+    fall through to python3 on PATH rather than trying to run
+    `/usr/bin/env -m mempalace`.
+    """
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    bindir = tmp_path / "bin"
+    _make_console_script(bindir / "mempalace-mcp", "/usr/bin/env python3")
+
+    env = {**os.environ, "HOME": str(home), "PATH": f"{bindir}:/usr/bin:/bin"}
+    env.pop("MEMPAL_PYTHON", None)
+
+    resolved = _resolve_python(env)
+    assert resolved != "/usr/bin/env", "resolver must not return /usr/bin/env"
+    assert os.path.basename(resolved).startswith("python"), (
+        f"resolver should fall back to a python3 on PATH; got {resolved!r}"
+    )
+
+
+def test_resolve_python_skips_shebang_interp_that_is_not_executable(
+    tmp_path: Path,
+) -> None:
+    """A shebang pointing at a missing/non-executable interpreter is skipped.
+
+    Guards against a stale console script whose interpreter was deleted:
+    the resolver must fall through to python3 rather than returning a
+    dead path.
+    """
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    bindir = tmp_path / "bin"
+    missing = tmp_path / "pyhome" / "python3.12"  # never created -> not -x
+    _make_console_script(bindir / "mempalace-mcp", str(missing))
+
+    env = {**os.environ, "HOME": str(home), "PATH": f"{bindir}:/usr/bin:/bin"}
+    env.pop("MEMPAL_PYTHON", None)
+
+    resolved = _resolve_python(env)
+    assert resolved != str(missing), "resolver returned a non-executable shebang interp"
+    assert os.path.basename(resolved).startswith("python"), (
+        f"resolver should fall back to python3 on PATH; got {resolved!r}"
+    )
+
+
+def test_resolve_python_falls_back_to_path_python3_without_console_scripts(
+    tmp_path: Path,
+) -> None:
+    """With no mempalace console scripts on PATH, resolve to python3 (prior behaviour)."""
+    home = tmp_path / "home"
+    _ensure_palace(home)
+
+    env = {**os.environ, "HOME": str(home), "PATH": "/usr/bin:/bin"}
+    env.pop("MEMPAL_PYTHON", None)
+
+    resolved = _resolve_python(env)
+    assert os.path.basename(resolved).startswith("python"), (
+        f"resolver should fall back to python3 on PATH; got {resolved!r}"
+    )

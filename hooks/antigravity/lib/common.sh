@@ -49,21 +49,82 @@ MEMPAL_AGY_LOG="$MEMPAL_STATE_DIR/antigravity_hook.log"
 
 # ── Python interpreter resolution ─────────────────────────────────────
 #
-# Resolution order:
-#   1. $MEMPAL_PYTHON        — explicit user override (absolute path)
-#   2. $(command -v python3) — first python3 on the hook's PATH
-#   3. bare "python3"        — last-resort fallback
+# The hooks run mempalace as `"$MEMPAL_PYTHON_BIN" -m mempalace`, so the
+# resolved interpreter MUST be one that has the mempalace package
+# importable. The single most common install path —
+# `uv tool install mempalace` (and `pipx install`) — puts the
+# `mempalace` / `mempalace-mcp` *console scripts* on PATH inside an
+# ISOLATED environment whose interpreter is NOT the system `python3`.
+# So naively resolving `command -v python3` lands on a system Python
+# that can't import mempalace, the `-m mempalace` probe fails, and
+# mining silently never fires. (This bit a real user on PR #1633.)
+#
+# Resolution order — first hit wins:
+#   1. $MEMPAL_PYTHON                         — explicit operator override
+#   2. shebang of the mempalace-mcp / mempalace console script on PATH
+#        — pip/uv write these with an absolute-path shebang pointing at
+#          the exact interpreter that owns the package. This is the SAME
+#          console script mcp_config.json launches, so if the MCP server
+#          can start, the hooks resolve a working interpreter too — no
+#          MEMPAL_PYTHON needed for the common install paths.
+#   3. $(command -v python3)                  — an activated dev venv /
+#          editable install where python3 itself owns the package
+#   4. bare "python3"                         — last-resort fallback
+#
+# Steps 2-4 are pure string parsing + stat (no Python subprocess), so
+# resolution stays cheap enough to run at source time on every hook
+# fire, including gated-out / kill-switched ones. We deliberately do
+# NOT run an `import mempalace` probe here: building that import pays
+# the chromadb/onnx cold-start cost, which a recent perf fix
+# (df295bd) moved OFF the hook foreground on purpose. The downstream
+# `-m mempalace --version` probe (backgrounded in the save hook,
+# subprocessed in the wake hook) is the safety net that catches a
+# shebang interpreter whose package is genuinely broken.
 mempal_resolve_python() {
+    # 1. Explicit override always wins.
     local p="${MEMPAL_PYTHON:-}"
     if [ -n "$p" ] && [ -x "$p" ]; then
         printf '%s' "$p"
         return 0
     fi
+
+    # 2. Derive the interpreter from a mempalace console-script shebang.
+    local script_path shebang interp
+    for script_path in mempalace-mcp mempalace; do
+        script_path="$(command -v "$script_path" 2>/dev/null || true)"
+        [ -n "$script_path" ] || continue
+        [ -r "$script_path" ] || continue
+        shebang="$(sed -n '1p' "$script_path" 2>/dev/null)"
+        case "$shebang" in
+            '#!'*)
+                interp="${shebang#\#!}"     # drop the leading '#!'
+                interp="${interp%$'\r'}"    # strip a trailing CR (CRLF files)
+                interp="${interp# }"        # drop one leading space
+                interp="${interp%% *}"      # first whitespace-delimited token
+                # Guard against `#!/usr/bin/env python` wrappers: only
+                # accept a token whose basename looks like a Python
+                # interpreter and is executable. An `env`-style shebang
+                # yields `/usr/bin/env` here, which we skip.
+                case "${interp##*/}" in
+                    python*)
+                        if [ -x "$interp" ]; then
+                            printf '%s' "$interp"
+                            return 0
+                        fi
+                        ;;
+                esac
+                ;;
+        esac
+    done
+
+    # 3. First python3 on PATH.
     p="$(command -v python3 2>/dev/null || true)"
     if [ -n "$p" ]; then
         printf '%s' "$p"
         return 0
     fi
+
+    # 4. Last-resort bare name.
     printf '%s' "python3"
 }
 MEMPAL_PYTHON_BIN="$(mempal_resolve_python)"

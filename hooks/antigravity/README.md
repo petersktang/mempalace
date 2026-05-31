@@ -132,12 +132,20 @@ canonical UX and what we recommend.
 1. Look for the most recent `[event=stop]` lines in
    `antigravity_hook.log` — `count` and `interval` should both be
    visible. Mining only triggers when `count % interval == 0`.
-2. Ensure `mempalace` is on `$PATH` (the `command -v mempalace` check
-   in the hook). On a GUI-launched Antigravity, the harness PATH may
-   differ from your shell PATH; export `MEMPAL_PYTHON=/abs/path/python`
-   or wrap `mempalace` in a venv-aware shim.
-3. Check `~/.mempalace/hook_state/mine_pids/` for stuck PID slots if
-   mines never seem to start.
+2. Ensure a Python that can import `mempalace` is reachable. The hook
+   runs `"$MEMPAL_PYTHON_BIN" -m mempalace`, where `MEMPAL_PYTHON_BIN`
+   is resolved (in order) from `$MEMPAL_PYTHON`, the
+   `mempalace-mcp` / `mempalace` console-script shebang on `$PATH`,
+   then `python3`. A failed probe logs:
+
+   ```
+   ERROR: mempalace is not runnable via <python> -m mempalace; install mempalace or set MEMPAL_PYTHON
+   ```
+
+   On a GUI-launched Antigravity the harness `PATH` may differ from
+   your shell `PATH`; if the shebang heuristic can't find the right
+   interpreter, export `MEMPAL_PYTHON=/abs/path/python` (e.g.
+   `"$(uv tool dir)/mempalace/bin/python"`) and restart.
 
 ### Wake injection isn't appearing
 
