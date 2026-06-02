@@ -2459,6 +2459,66 @@ class TestCacheInvalidation:
         assert col is None
 
 
+class TestImportKillSwitchSafety:
+    """Importing mcp_server must not recreate ~/.mempalace (#1676).
+
+    The module-level WAL setup used to ``mkdir(parents=True)`` at import,
+    recreating ``~/.mempalace`` even after the user removed it as the
+    documented kill-switch gesture (``_palace_root_exists()``, #1305),
+    silently re-arming the autosave/mining hooks. WAL creation is now
+    deferred to the first actual write.
+    """
+
+    def test_import_does_not_recreate_palace_root(self, tmp_path):
+        """import mempalace.mcp_server must not create ~/.mempalace.
+
+        Runs in a fresh subprocess with HOME pointed at tmp_path so the
+        assertion targets a clean filesystem, independent of conftest's
+        session-level HOME patch.
+        """
+        palace_root = tmp_path / ".mempalace"
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MEMPAL")}
+        env["HOME"] = str(tmp_path)
+        env["USERPROFILE"] = str(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-c", "import mempalace.mcp_server"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, f"import failed: {result.stderr}"
+        assert not palace_root.exists(), (
+            f"importing mcp_server recreated {palace_root} as a side effect, "
+            "defeating the _palace_root_exists() kill-switch (#1676)"
+        )
+
+    def test_wal_log_creates_dir_lazily_on_first_write(self, tmp_path, monkeypatch):
+        """_wal_log creates its directory on first use.
+
+        Proves the deferred setup still works (defers WAL creation to write
+        time, does not disable it) and preserves the WAL permission bits.
+        """
+        from mempalace import mcp_server
+
+        wal_file = tmp_path / "fresh" / "wal" / "write_log.jsonl"
+        assert not wal_file.parent.exists()
+        monkeypatch.setattr(mcp_server, "_WAL_FILE", wal_file)
+
+        mcp_server._wal_log("test_op", {"safe": "ok"})
+
+        assert wal_file.exists(), "lazy WAL init did not create the log on first write"
+        entry = json.loads(wal_file.read_text().strip())
+        assert entry["operation"] == "test_op"
+        assert entry["params"]["safe"] == "ok"
+
+        # Permission bits the refactor must preserve (POSIX only; Windows
+        # ignores chmod and the code swallows NotImplementedError).
+        if sys.platform != "win32":
+            assert wal_file.stat().st_mode & 0o777 == 0o600
+            assert wal_file.parent.stat().st_mode & 0o777 == 0o700
+
+
 class TestKGLazyCache:
     """Lazy per-path KnowledgeGraph cache (issue #1136)."""
 
