@@ -1911,7 +1911,23 @@ def _compute_entity_tunnels_for_wing(wing: str) -> int:
 
 
 def status(palace_path: str):
-    """Show what's been filed in the palace."""
+    """Show what's been filed in the palace.
+
+    Tallies drawers by wing/room directly from ``chroma.sqlite3`` so a routine
+    status check never cold-loads the HNSW vector index — a load that costs
+    tens of seconds of CPU per call on large palaces (#1681). Falls back to the
+    ChromaDB client path when the sqlite read is unavailable (missing DB,
+    un-bootstrapped collection, or an unexpected schema); the fallback also
+    emits the state-specific guidance for absent/empty palaces.
+    """
+    from .backends.chroma import _sqlite_wing_room_counts
+
+    counts = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
+    if counts is not None:
+        total, wing_rooms = counts
+        _print_status(total, wing_rooms)
+        return
+
     col = _open_collection_or_explain(palace_path)
     if col is None:
         return
@@ -1932,6 +1948,11 @@ def status(palace_path: str):
             wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
         offset += len(batch)
 
+    _print_status(total, wing_rooms)
+
+
+def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
+    """Render the wing/room histogram shared by both status code paths."""
     print(f"\n{'=' * 55}")
     print(f"  MemPalace Status — {total} drawers")
     print(f"{'=' * 55}\n")

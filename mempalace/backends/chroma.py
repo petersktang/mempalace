@@ -7,6 +7,7 @@ import logging
 import os
 import pickle
 import sqlite3
+from collections import defaultdict
 from numbers import Integral
 from pathlib import Path
 from typing import Any, Optional
@@ -634,6 +635,93 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
             conn.close()
     except sqlite3.Error:
         return None
+
+
+def _sqlite_wing_room_counts(
+    palace_path: str, collection_name: str
+) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
+    """Tally drawers by wing/room straight from ``chroma.sqlite3``.
+
+    Returns ``(total, {wing: {room: count}})`` or ``None`` when the read
+    cannot be trusted — missing DB file, the collection has not been
+    bootstrapped, or any sqlite error (including a sustained writer lock).
+    ``None`` signals the caller to fall back to the ChromaDB client path
+    (which also emits the right state-specific guidance for absent/empty
+    palaces).
+
+    The point of reading sqlite directly is to count drawers **without opening
+    the collection**, because opening it cold-loads the HNSW vector index. On
+    large palaces that load costs tens of seconds of CPU per call — a steep,
+    pointless tax for an inspection command that only needs metadata the
+    relational tables already hold (#1681). Wings/rooms live in plain
+    ``embedding_metadata`` rows, joined to ``embeddings`` on the
+    ``(id, key)`` primary key, so the tally is a bounded scan of the metadata
+    segment: sub-second warm, a few seconds cold on a multi-GB DB — versus the
+    ~60s the vector-index load costs.
+
+    Sibling readers that count the same way: :func:`_sqlite_embedding_count`
+    (total only) and ``mcp_server._tool_status_via_sqlite`` (independent
+    wing/room histograms for the #1222 fallback). This one cross-tabulates
+    wing→room to match the ChromaDB ``status()`` output shape.
+
+    Notes:
+    - ``busy_timeout`` lets a transient checkpoint lock resolve instead of
+      instantly demoting to the slow HNSW path; a *sustained* lock still
+      raises and falls back (slow but correct).
+    - ``s.scope = 'METADATA'`` makes the single-segment join explicit so a
+      future ChromaDB that also stored per-vector-segment rows could not
+      silently double every count.
+    - ``COALESCE`` over ``string_value``/``int_value``/``float_value`` matches
+      the ChromaDB path, which surfaces a numeric wing/room natively rather
+      than dropping it to ``"?"``.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            # Wait out a transient writer/checkpoint lock rather than falling
+            # straight back to the expensive vector-index path (#1681).
+            conn.execute("PRAGMA busy_timeout = 3000")
+            # Distinguish "collection never bootstrapped" (-> None, so the
+            # caller can show the 'initialized but empty' message) from
+            # "collection exists with zero drawers" (-> a real 0 tally).
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            rows = conn.execute(
+                """
+                SELECT COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
+                                CAST(wm.float_value AS TEXT), '?') AS wing,
+                       COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
+                                CAST(rm.float_value AS TEXT), '?') AS room,
+                       COUNT(*) AS n
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
+                LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
+                WHERE c.name = ?
+                GROUP BY wing, room
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+    total = 0
+    wing_rooms: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for wing, room, n in rows:
+        wing_rooms[wing][room] += int(n)
+        total += int(n)
+    return total, wing_rooms
 
 
 def _pin_hnsw_threads(collection) -> None:
