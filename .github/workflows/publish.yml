@@ -2,10 +2,16 @@ name: Publish to PyPI
 
 # Publishes mempalace to PyPI via Trusted Publishing (OIDC — no stored token).
 #
-# Trigger: a GitHub Release is *published* (not merely drafted). The release may
-# create the `v*` tag or be cut from an existing one — either way the checks
-# below run here on purpose, so this pipeline is self-contained and never
-# uploads a tag that isn't on main or doesn't match the version manifest.
+# Triggers:
+#   * release: published — the normal path (drafting + publishing a GitHub
+#     Release fires this).
+#   * workflow_dispatch — a manual escape hatch. GitHub does not reliably emit
+#     a `release` event when a *draft* tied to a pre-existing tag is published,
+#     so this lets a maintainer run the publish for any existing tag from the
+#     Actions tab ("Run workflow" → enter the tag, e.g. v3.4.0).
+#
+# Either way the checks below run on purpose, so this pipeline is self-contained
+# and never uploads a tag that isn't on main or doesn't match the version manifest.
 #
 # One-time setup required before the first run (see docs/RELEASING.md):
 #   1. PyPI → Manage project `mempalace` → Publishing → Add a trusted publisher:
@@ -17,6 +23,12 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (e.g. v3.4.0). Used when the release event didn't fire."
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,32 +38,52 @@ jobs:
     name: Build + pre-publish checks
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve the release tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG:-${INPUT_TAG:-}}"
+          if [[ -z "$tag" ]]; then
+            echo "::error::no tag to publish — neither a release tag nor a workflow_dispatch input was provided"
+            exit 1
+          fi
+          # Validate the shape before it is ever used as a git ref (ref-injection
+          # guard): a leading 'v' plus alphanumerics, dot, plus, hyphen only.
+          if [[ ! "$tag" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error::tag '$tag' is not a valid release tag (expected vX.Y.Z[-suffix])"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $tag"
+
       - uses: actions/checkout@v6
         with:
-          # No explicit ref: on a release event the default checkout is already
-          # the release tag's commit (github.ref = refs/tags/<tag>). This avoids
-          # interpolating the event-controlled tag_name into a checkout ref
-          # (ref-injection). fetch-depth: 0 gives the ancestry check full history.
-          fetch-depth: 0
+          # Safe: steps.tag.outputs.tag is format-validated above. On a release
+          # event this equals the release tag; on workflow_dispatch it's the input.
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0 # full history for the ancestry check
 
-      - name: Verify the release tag is on main
+      - name: Verify the tag is on main
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
-          tag_sha=$(git rev-parse HEAD)  # the checked-out release tag commit
+          tag_sha=$(git rev-parse HEAD) # the checked-out tag commit
           main_sha=$(git rev-parse FETCH_HEAD)
           if git merge-base --is-ancestor "$tag_sha" "$main_sha"; then
             echo "Tag $TAG ($tag_sha) is reachable from main — OK."
           else
-            echo "::error::Release tag $TAG is not an ancestor of main. Releases must be cut from main."
+            echo "::error::tag $TAG is not an ancestor of main. Releases must be cut from main."
             exit 1
           fi
 
       - name: Verify the tag matches the version manifest
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           # version.py is the source of truth (per CLAUDE.md); version-guard.yml
@@ -90,7 +122,7 @@ jobs:
       name: pypi
       url: https://pypi.org/p/mempalace
     permissions:
-      id-token: write  # mint the short-lived OIDC token for Trusted Publishing
+      id-token: write # mint the short-lived OIDC token for Trusted Publishing
     steps:
       - name: Download dist artifacts
         uses: actions/download-artifact@v4
