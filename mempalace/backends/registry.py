@@ -207,6 +207,7 @@ def resolve_backend_for_palace(
 def _register_builtins() -> None:
     """Register chroma as the in-tree default."""
     from .chroma import ChromaBackend
+    from .pgvector import PgVectorBackend
     from .qdrant import QdrantBackend
     from .sqlite_exact import SQLiteExactBackend
 
@@ -217,6 +218,8 @@ def _register_builtins() -> None:
         _registry["qdrant"] = QdrantBackend
     if "sqlite_exact" not in _registry:
         _registry["sqlite_exact"] = SQLiteExactBackend
+    if "pgvector" not in _registry:
+        _registry["pgvector"] = PgVectorBackend
 
 
 _register_builtins()

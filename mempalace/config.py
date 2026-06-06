@@ -384,6 +384,30 @@ class MempalaceConfig:
         return timeout if timeout > 0 else 10.0
 
     @property
+    def pgvector_dsn(self):
+        """Postgres DSN for the opt-in ``pgvector`` backend.
+
+        Defaults to a localhost DSN so selecting pgvector never silently sends
+        memory to a remote database. Point at a LAN or cloud Postgres via config
+        or ``MEMPALACE_PGVECTOR_DSN`` only when deliberately chosen.
+        """
+        env_val = os.environ.get("MEMPALACE_PGVECTOR_DSN")
+        if env_val:
+            return env_val.strip()
+        return str(
+            self._file_config.get("pgvector_dsn", "postgresql://localhost:5432/mempalace")
+        ).strip()
+
+    @property
+    def pgvector_namespace(self):
+        """Optional pgvector table namespace/prefix for multi-tenant isolation."""
+        env_val = os.environ.get("MEMPALACE_PGVECTOR_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("pgvector_namespace")
+        return str(value).strip() if value else None
+
+    @property
     def people_map(self):
         """Mapping of name variants to canonical names."""
         if self._people_map_file.exists():

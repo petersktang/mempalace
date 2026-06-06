@@ -4,6 +4,8 @@ import uuid
 import numpy as np
 import pytest
 
+from _backend_conformance import assert_partition_isolation
+
 from mempalace.backends import (
     BackendError,
     BackendMismatchError,
@@ -434,6 +436,51 @@ def test_palace_wrapper_embeds_for_qdrant(tmp_path, monkeypatch, fake_qdrant):
     col.add(documents=["wrapped qdrant document"], ids=["wrapped"], metadatas=[{"wing": "w"}])
     result = col.query(query_texts=["wrapped"], n_results=1)
     assert result.ids == [["wrapped"]]
+
+
+def test_qdrant_rejects_pure_remote_palace(tmp_path, fake_qdrant):
+    """No local_path means the marker (the only mismatch-protection anchor)
+    cannot be written or validated, so the backend must refuse rather than
+    silently open an unprotected remote collection (RFC 001 isolation contract, PR #1679)."""
+    backend = QdrantBackend()
+    palace = PalaceRef(id="tenant-remote", local_path=None, namespace="tenant-remote")
+    with pytest.raises(BackendError, match="local palace path"):
+        backend.get_collection(palace=palace, collection_name="drawers", create=True)
+
+
+def test_qdrant_cross_palace_isolation_conformance(tmp_path, fake_qdrant):
+    """Shared per-PalaceRef.id isolation conformance (RFC 001 isolation contract)."""
+    backend = QdrantBackend()
+    cols = []
+    for label in ("alpha", "beta"):
+        path = tmp_path / label
+        ref = PalaceRef(id=str(path), local_path=str(path))
+        cols.append(backend.get_collection(palace=ref, collection_name="drawers", create=True))
+    assert_partition_isolation(backend, cols[0], cols[1], embedding=[1.0, 0.0])
+
+
+def test_qdrant_namespace_isolation_conformance(tmp_path, fake_qdrant):
+    """Shared per-PalaceRef.namespace isolation conformance — qdrant advertises
+    ``supports_namespace_isolation`` so it must satisfy the cross-namespace MUST
+    (RFC 001 isolation contract)."""
+    assert "supports_namespace_isolation" in QdrantBackend.capabilities
+    backend = QdrantBackend()
+    ref_a = PalaceRef(
+        id=str(tmp_path / "tenant-a"),
+        local_path=str(tmp_path / "tenant-a"),
+        namespace="tenant-a",
+    )
+    ref_b = PalaceRef(
+        id=str(tmp_path / "tenant-b"),
+        local_path=str(tmp_path / "tenant-b"),
+        namespace="tenant-b",
+    )
+    col_a = backend.get_collection(palace=ref_a, collection_name="drawers", create=True)
+    col_b = backend.get_collection(palace=ref_b, collection_name="drawers", create=True)
+    # Mechanism: the namespace partitions the remote collection name.
+    assert col_a._remote_collection != col_b._remote_collection
+    # Behaviour: a record under one namespace is invisible under the other.
+    assert_partition_isolation(backend, col_a, col_b, embedding=[1.0, 0.0])
 
 
 def test_qdrant_live_rest_roundtrip_when_enabled(tmp_path):

@@ -185,6 +185,8 @@ def _backend_artifact_label(backend_name: Optional[str]) -> str:
         return "chroma.sqlite3"
     if backend_name == "qdrant":
         return "qdrant_backend.json"
+    if backend_name == "pgvector":
+        return "pgvector_backend.json"
     if backend_name == "sqlite_exact":
         return "sqlite_exact.sqlite3"
     return "backend database"
@@ -238,6 +240,14 @@ def _open_collection_or_explain(
     except BackendMismatchError as e:
         emit(f"\n  Backend mismatch at {palace_path}: {e}")
         emit("  Select the matching backend or use a fresh palace directory.")
+        return None
+    except KeyError as e:
+        # Unknown backend name (e.g. a typo in MEMPALACE_BACKEND/--backend):
+        # resolve_backend_name -> get_backend_class raises KeyError carrying the
+        # available-backend list. Surface it as a CLI state message rather than
+        # letting it escape as a stack trace.
+        emit(f"\n  Unknown backend selected for {palace_path}: {e.args[0] if e.args else e}")
+        emit("  Set --backend or MEMPALACE_BACKEND to a registered backend.")
         return None
     detected = detect_backend_for_path(palace_path)
     if detected is None:

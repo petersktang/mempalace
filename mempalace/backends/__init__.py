@@ -34,6 +34,7 @@ from .base import (
     UnsupportedFilterError,
 )
 from .chroma import ChromaBackend, ChromaCollection
+from .pgvector import PgVectorBackend, PgVectorCollection
 from .qdrant import QdrantBackend, QdrantCollection
 from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
 from .registry import (
@@ -65,6 +66,8 @@ __all__ = [
     "LexicalResult",
     "PalaceNotFoundError",
     "PalaceRef",
+    "PgVectorBackend",
+    "PgVectorCollection",
     "QdrantBackend",
     "QdrantCollection",
     "QueryResult",

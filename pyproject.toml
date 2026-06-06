@@ -60,6 +60,7 @@ mempalace-mcp = "mempalace.mcp_server:main"
 
 [project.entry-points."mempalace.backends"]
 chroma = "mempalace.backends.chroma:ChromaBackend"
+pgvector = "mempalace.backends.pgvector:PgVectorBackend"
 qdrant = "mempalace.backends.qdrant:QdrantBackend"
 sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
 
@@ -94,6 +95,11 @@ dev = [
     "mypy>=1.0",
 ]
 spellcheck = ["autocorrect>=2.0"]
+# Opt-in Postgres + pgvector backend. Only the psycopg driver is needed on the
+# client; the server must have the `vector` extension available. Selected via
+# MEMPALACE_BACKEND=pgvector / --backend pgvector; never required for the
+# default (Chroma) install.
+pgvector = ["psycopg[binary]>=3.1"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
 #   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)

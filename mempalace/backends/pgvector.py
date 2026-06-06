@@ -1,9 +1,25 @@
-"""Qdrant REST backend for MemPalace.
+"""Postgres + pgvector backend for MemPalace.
 
-Qdrant is an opt-in external-service backend. Chroma remains the default; this
-adapter only runs when the user explicitly selects ``qdrant`` via config, env,
-or CLI/MCP flag. Embeddings are still produced locally by MemPalace through the
-core embedding wrapper before vectors are sent to Qdrant.
+pgvector is an opt-in external-service backend, the SQL counterpart to the
+Qdrant REST backend. Chroma remains the default; this adapter only runs when
+the user explicitly selects ``pgvector`` via config, env, or CLI/MCP flag.
+Embeddings are still produced locally by MemPalace through the core embedding
+wrapper before vectors are written to Postgres.
+
+Why a second external backend: it exercises the storage contract on a
+fundamentally different substrate (SQL + JSONB + the pgvector ``<=>`` operator)
+than Qdrant's REST/dict model, proving the ``BaseBackend`` / ``BaseCollection``
+surface is not accidentally shaped around one vendor.
+
+Isolation model (RFC 001 isolation contract): one table per
+``namespace`` + ``palace`` + ``collection``. The namespace contributes to the
+table name, so this backend advertises ``supports_namespace_isolation`` and
+satisfies the cross-namespace conformance arm.
+
+Dependency posture: the live client needs the optional ``psycopg`` dependency
+(``pip install mempalace[pgvector]``), imported lazily so the package imports
+fine without it. CI runs against an in-memory fake client; the live Postgres
+round-trip is gated behind ``MEMPALACE_PGVECTOR_LIVE_URL``.
 """
 
 from __future__ import annotations
@@ -13,21 +29,18 @@ import logging
 import os
 import re
 import threading
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Optional
-from urllib import error as urlerror
 from urllib import parse as urlparse
-from urllib import request as urlrequest
 
 import numpy as np
 
 from .base import (
     BackendClosedError,
-    BackendMismatchError,
     BackendError,
+    BackendMismatchError,
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
@@ -45,20 +58,25 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_URL = "http://localhost:6333"
-_MARKER_FILENAME = "qdrant_backend.json"
-_PAYLOAD_ID = "mempalace_id"
-_PAYLOAD_DOCUMENT = "document"
-_PAYLOAD_METADATA = "metadata"
-_POINT_NAMESPACE = uuid.UUID("c06c3fc7-5c14-4dc4-84c2-24a5f72d8dc1")
+_DEFAULT_DSN = "postgresql://localhost:5432/mempalace"
+_MARKER_FILENAME = "pgvector_backend.json"
+_MAX_IDENTIFIER = 63  # Postgres identifier byte limit.
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+# Operators that translate to a JSONB containment predicate and so can be
+# pushed down to SQL. Comparisons, $or and $contains stay on the local exact
+# path (Python filtering), mirroring the Qdrant backend's local fallback.
 _SUPPORTED_OPERATORS = frozenset(
     {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
 )
+_PUSHDOWN_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and"})
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj or {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
 def _tokenize(text: str) -> list[str]:
@@ -113,7 +131,7 @@ def _validate_where(where: Optional[dict]) -> None:
             continue
         for key, value in node.items():
             if key.startswith("$") and key not in _SUPPORTED_OPERATORS:
-                raise UnsupportedFilterError(f"operator {key!r} not supported by qdrant")
+                raise UnsupportedFilterError(f"operator {key!r} not supported by pgvector")
             if isinstance(value, dict):
                 stack.append(value)
             elif isinstance(value, list):
@@ -150,7 +168,7 @@ def _compare(actual: Any, op: str, expected: Any) -> bool:
             return actual <= expected
     except TypeError:
         return False
-    raise UnsupportedFilterError(f"operator {op!r} not supported by qdrant")
+    raise UnsupportedFilterError(f"operator {op!r} not supported by pgvector")
 
 
 def _matches_where(meta: dict, where: Optional[dict]) -> bool:
@@ -168,7 +186,7 @@ def _matches_where(meta: dict, where: Optional[dict]) -> bool:
                 return False
             continue
         if key.startswith("$"):
-            raise UnsupportedFilterError(f"operator {key!r} not supported by qdrant")
+            raise UnsupportedFilterError(f"operator {key!r} not supported by pgvector")
         actual = meta.get(key)
         if isinstance(expected, dict):
             for op, operand in expected.items():
@@ -199,6 +217,38 @@ def _matches_where_document(document: str, where_document: Optional[dict]) -> bo
             continue
         raise UnsupportedFilterError(f"where_document operator {key!r} not supported")
     return True
+
+
+def _requires_local_filter(where: Optional[dict], where_document: Optional[dict] = None) -> bool:
+    """True when ``where``/``where_document`` cannot be fully pushed to SQL.
+
+    Equality, ``$in``, ``$nin``, ``$ne`` and ``$and`` become JSONB containment
+    predicates; everything else ($or, $contains, comparisons, any
+    where_document) is evaluated on the local exact path so correctness never
+    depends on a hand-rolled SQL cast.
+    """
+    if where_document:
+        return True
+    if not where:
+        return False
+    stack = [where]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        for key, value in node.items():
+            if key.startswith("$") and key not in _PUSHDOWN_OPERATORS:
+                return True
+            if isinstance(value, dict):
+                # A field mapping to an operator dict: only pushdown operators
+                # keep it on the fast path.
+                for op in value:
+                    if op.startswith("$") and op not in _PUSHDOWN_OPERATORS:
+                        return True
+                stack.append(value)
+            elif isinstance(value, list):
+                stack.extend(item for item in value if isinstance(item, dict))
+    return False
 
 
 def _validate_write_batch(
@@ -232,7 +282,9 @@ def _normalize_vectors(embeddings: list[list[float]]) -> tuple[list[list[float]]
         vectors.append(arr.astype(float).tolist())
         dims.add(int(arr.size))
     if len(dims) > 1:
-        raise DimensionMismatchError(f"qdrant batch cannot mix embedding dimensions {sorted(dims)}")
+        raise DimensionMismatchError(
+            f"pgvector batch cannot mix embedding dimensions {sorted(dims)}"
+        )
     return vectors, dims.pop() if dims else 0
 
 
@@ -242,36 +294,6 @@ def _jsonable_metadata(meta: dict | None) -> dict:
     except (TypeError, ValueError):
         value = {}
     return value if isinstance(value, dict) else {}
-
-
-def _point_id(doc_id: str) -> str:
-    return str(uuid.uuid5(_POINT_NAMESPACE, str(doc_id)))
-
-
-def _slug(value: str, fallback: str = "palace") -> str:
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_")
-    safe = safe or fallback
-    if len(safe) <= 64:
-        return safe
-    digest = sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
-    return f"{safe[:51]}_{digest}"
-
-
-def _payload_row(point: dict) -> dict:
-    payload = point.get("payload") or {}
-    meta = payload.get(_PAYLOAD_METADATA) or {}
-    if not isinstance(meta, dict):
-        meta = {}
-    vector = point.get("vector")
-    if isinstance(vector, dict):
-        vector = vector.get("") or vector.get("default") or next(iter(vector.values()), None)
-    return {
-        "id": str(payload.get(_PAYLOAD_ID) or point.get("id") or ""),
-        "document": str(payload.get(_PAYLOAD_DOCUMENT) or ""),
-        "metadata": meta,
-        "embedding": vector if isinstance(vector, list) else None,
-        "score": point.get("score"),
-    }
 
 
 def _vector_distance(query: np.ndarray, vector: list[float] | None) -> Optional[float]:
@@ -285,29 +307,108 @@ def _vector_distance(query: np.ndarray, vector: list[float] | None) -> Optional[
     return 1.0 - max(-1.0, min(1.0, cos))
 
 
-def _qdrant_score_to_distance(score: Any) -> float:
-    try:
-        return 1.0 - max(-1.0, min(1.0, float(score)))
-    except (TypeError, ValueError):
-        return 1.0
+def _vector_literal(vector: list[float]) -> str:
+    """Render a vector as the pgvector text literal ``[1,2,3]``.
+
+    Using the text form keeps the optional dependency surface to ``psycopg``
+    alone — no ``pgvector`` Python adapter is required, only the server-side
+    extension.
+    """
+    return "[" + ",".join(repr(float(v)) for v in vector) + "]"
 
 
-class _QdrantHTTPError(BackendError):
-    def __init__(self, status: int, detail: str):
-        super().__init__(f"Qdrant HTTP {status}: {detail}")
-        self.status = status
-        self.detail = detail
+def _parse_vector(value: Any) -> Optional[list[float]]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [float(v) for v in value]
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.strip("[]")
+    if not text:
+        return []
+    return [float(part) for part in text.split(",")]
+
+
+def _slug(value: str, fallback: str = "palace") -> str:
+    safe = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
+    safe = safe or fallback
+    if len(safe) <= 48:
+        return safe
+    digest = sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+    return f"{safe[:35]}_{digest}"
+
+
+def _pg_identifier(name: str) -> str:
+    """Clamp an identifier to Postgres' 63-byte limit, hashing the overflow."""
+    if len(name.encode("utf-8")) <= _MAX_IDENTIFIER:
+        return name
+    digest = sha256(name.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+    return f"{name[:50]}_{digest}"
+
+
+def _quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _field_sql(field: str, expression: Any, params: list) -> str:
+    """Translate one field predicate to a JSONB containment expression."""
+    if isinstance(expression, dict):
+        parts = []
+        for op, operand in expression.items():
+            if op == "$eq":
+                params.append(_json_dumps({field: operand}))
+                parts.append("metadata @> %s::jsonb")
+            elif op == "$ne":
+                params.append(_json_dumps({field: operand}))
+                parts.append("(NOT (metadata @> %s::jsonb))")
+            elif op == "$in":
+                ors = []
+                for item in operand or []:
+                    params.append(_json_dumps({field: item}))
+                    ors.append("metadata @> %s::jsonb")
+                parts.append("(" + (" OR ".join(ors) if ors else "FALSE") + ")")
+            elif op == "$nin":
+                ors = []
+                for item in operand or []:
+                    params.append(_json_dumps({field: item}))
+                    ors.append("metadata @> %s::jsonb")
+                parts.append("(NOT (" + (" OR ".join(ors) if ors else "FALSE") + "))")
+            else:  # pragma: no cover - guarded by _requires_local_filter
+                raise UnsupportedFilterError(f"operator {op!r} not pushed down by pgvector")
+        return " AND ".join(parts) if parts else "TRUE"
+    params.append(_json_dumps({field: expression}))
+    return "metadata @> %s::jsonb"
+
+
+def _where_to_sql(where: Optional[dict], params: list) -> str:
+    """Translate the pushdown filter subset to a JSONB SQL predicate.
+
+    Appends bound parameters to ``params`` and returns a boolean SQL string.
+    Only operators allowed past :func:`_requires_local_filter` reach here.
+    """
+    if not where:
+        return "TRUE"
+    clauses = []
+    for key, expected in where.items():
+        if key == "$and":
+            for clause in expected or []:
+                clauses.append(f"({_where_to_sql(clause, params)})")
+            continue
+        if key.startswith("$"):  # pragma: no cover - guarded upstream
+            raise UnsupportedFilterError(f"operator {key!r} not pushed down by pgvector")
+        clauses.append(_field_sql(key, expected, params))
+    return " AND ".join(clauses) if clauses else "TRUE"
 
 
 @dataclass(frozen=True)
-class _QdrantConfig:
-    url: str = _DEFAULT_URL
-    api_key: Optional[str] = None
-    timeout: float = 10.0
+class _PgVectorConfig:
+    dsn: str = _DEFAULT_DSN
     namespace: Optional[str] = None
 
     @classmethod
-    def from_options(cls, options: Optional[dict] = None) -> "_QdrantConfig":
+    def from_options(cls, options: Optional[dict] = None) -> "_PgVectorConfig":
         options = options or {}
         try:
             from ..config import MempalaceConfig
@@ -315,371 +416,269 @@ class _QdrantConfig:
             cfg = MempalaceConfig()
         except Exception:  # pragma: no cover - config import should be boring
             cfg = None
-        url = (
-            options.get("url")
-            or os.environ.get("MEMPALACE_QDRANT_URL")
-            or getattr(cfg, "qdrant_url", None)
-            or _DEFAULT_URL
-        )
-        api_key = (
-            options.get("api_key")
-            or os.environ.get("MEMPALACE_QDRANT_API_KEY")
-            or getattr(cfg, "qdrant_api_key", None)
+        dsn = (
+            options.get("dsn")
+            or options.get("url")
+            or os.environ.get("MEMPALACE_PGVECTOR_DSN")
+            or getattr(cfg, "pgvector_dsn", None)
+            or _DEFAULT_DSN
         )
         namespace = (
             options.get("namespace")
-            or os.environ.get("MEMPALACE_QDRANT_NAMESPACE")
-            or getattr(cfg, "qdrant_namespace", None)
+            or os.environ.get("MEMPALACE_PGVECTOR_NAMESPACE")
+            or getattr(cfg, "pgvector_namespace", None)
         )
-        raw_timeout = (
-            options.get("timeout")
-            or os.environ.get("MEMPALACE_QDRANT_TIMEOUT")
-            or getattr(cfg, "qdrant_timeout", None)
-            or 10.0
-        )
-        try:
-            timeout = float(raw_timeout)
-        except (TypeError, ValueError):
-            timeout = 10.0
-        if timeout <= 0:
-            timeout = 10.0
         return cls(
-            url=str(url).rstrip("/") or _DEFAULT_URL,
-            api_key=str(api_key) if api_key else None,
-            timeout=timeout,
+            dsn=str(dsn).strip() or _DEFAULT_DSN,
             namespace=str(namespace).strip() or None if namespace else None,
         )
 
 
-class _QdrantRESTClient:
-    def __init__(self, config: _QdrantConfig):
+class _PgVectorClient:
+    """Thin psycopg wrapper. ``psycopg`` is imported lazily on first connect."""
+
+    def __init__(self, config: _PgVectorConfig):
         self._config = config
+        self._conn = None
+        self._lock = threading.RLock()
 
-    def request(
-        self,
-        method: str,
-        path: str,
-        *,
-        body: Optional[dict] = None,
-        query: Optional[dict] = None,
-    ) -> dict:
-        url = f"{self._config.url}{path}"
-        if query:
-            url = f"{url}?{urlparse.urlencode(query)}"
-        data = None
-        headers = {"Content-Type": "application/json"}
-        if self._config.api_key:
-            headers["api-key"] = self._config.api_key
-        if body is not None:
-            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        req = urlrequest.Request(url, data=data, method=method, headers=headers)
+    def _connect(self):
+        if self._conn is not None and not getattr(self._conn, "closed", False):
+            return self._conn
         try:
-            with urlrequest.urlopen(req, timeout=self._config.timeout) as resp:
-                raw = resp.read()
-        except urlerror.HTTPError as exc:
-            raw = exc.read()
-            detail = raw.decode("utf-8", errors="replace") if raw else str(exc)
-            raise _QdrantHTTPError(exc.code, detail) from exc
-        except urlerror.URLError as exc:
-            raise BackendError(f"Qdrant request failed: {exc.reason}") from exc
-        if not raw:
-            return {}
+            import psycopg
+        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+            raise BackendError(
+                "pgvector backend requires the optional 'psycopg' dependency; "
+                "install mempalace[pgvector]"
+            ) from exc
         try:
-            return json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise BackendError("Qdrant returned invalid JSON") from exc
+            self._conn = psycopg.connect(self._config.dsn)
+        except Exception as exc:  # noqa: BLE001 - surface any driver failure uniformly
+            raise BackendError(f"pgvector connection failed: {exc}") from exc
+        return self._conn
 
-    def collection_exists(self, collection: str) -> bool:
+    def _execute(self, sql: str, params=None, *, fetch: bool = False, many: bool = False):
+        conn = self._connect()
+        with self._lock:
+            try:
+                with conn.cursor() as cur:
+                    if many:
+                        cur.executemany(sql, params or [])
+                        rows = None
+                    else:
+                        cur.execute(sql, params or [])
+                        rows = cur.fetchall() if fetch else None
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001 - normalize to BackendError
+                try:
+                    conn.rollback()
+                except Exception:  # pragma: no cover - rollback best effort
+                    pass
+                raise BackendError(f"pgvector query failed: {exc}") from exc
+        return rows
+
+    def ping(self) -> None:
+        self._execute("SELECT 1", fetch=True)
+
+    def ensure_extension(self) -> None:
         try:
-            self.request("GET", f"/collections/{urlparse.quote(collection, safe='')}")
-        except _QdrantHTTPError as exc:
-            if exc.status == 404:
-                return False
-            raise
-        return True
+            self._execute("CREATE EXTENSION IF NOT EXISTS vector")
+        except BackendError:
+            # Extension may already exist or require elevated privilege; the
+            # table create will fail loudly later if the vector type is absent.
+            logger.debug("pgvector CREATE EXTENSION skipped", exc_info=True)
 
-    def get_collection_info(self, collection: str) -> dict:
-        return self.request("GET", f"/collections/{urlparse.quote(collection, safe='')}")
-
-    def create_collection(self, collection: str, dimension: int) -> None:
-        self.request(
-            "PUT",
-            f"/collections/{urlparse.quote(collection, safe='')}",
-            body={"vectors": {"size": int(dimension), "distance": "Cosine"}},
+    def table_exists(self, table: str) -> bool:
+        rows = self._execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = current_schema() AND table_name = %s",
+            [table],
+            fetch=True,
         )
+        return bool(rows)
 
-    def create_payload_index(self, collection: str, field_name: str, field_schema: str) -> None:
+    def table_dimension(self, table: str) -> Optional[int]:
         try:
-            self.request(
-                "PUT",
-                f"/collections/{urlparse.quote(collection, safe='')}/index",
-                query={"wait": "true"},
-                body={"field_name": field_name, "field_schema": field_schema},
+            rows = self._execute(
+                "SELECT a.atttypmod FROM pg_attribute a "
+                "WHERE a.attrelid = %s::regclass AND a.attname = 'embedding'",
+                [_quote_identifier(table)],
+                fetch=True,
             )
-        except _QdrantHTTPError as exc:
-            if exc.status in (400, 409):
-                logger.debug("Qdrant payload index creation skipped: %s", exc)
-                return
-            raise
+        except BackendError:
+            return None
+        if rows and rows[0] and rows[0][0] and int(rows[0][0]) > 0:
+            return int(rows[0][0])
+        return None
 
-    def upsert_points(self, collection: str, points: list[dict]) -> None:
-        self.request(
-            "PUT",
-            f"/collections/{urlparse.quote(collection, safe='')}/points",
-            query={"wait": "true"},
-            body={"points": points},
+    def create_table(self, table: str, dimension: int) -> None:
+        self.ensure_extension()
+        qi = _quote_identifier(table)
+        self._execute(
+            f"CREATE TABLE IF NOT EXISTS {qi} ("
+            "id text PRIMARY KEY, "
+            "document text NOT NULL DEFAULT '', "
+            "metadata jsonb NOT NULL DEFAULT '{}'::jsonb, "
+            f"embedding vector({int(dimension)}), "
+            "updated_at timestamptz)"
         )
 
-    def query_points(
+    def upsert_rows(self, table: str, rows: list[dict]) -> None:
+        if not rows:
+            return
+        qi = _quote_identifier(table)
+        sql = (
+            f"INSERT INTO {qi} (id, document, metadata, embedding, updated_at) "
+            "VALUES (%s, %s, %s::jsonb, %s::vector, %s) "
+            "ON CONFLICT (id) DO UPDATE SET "
+            "document = EXCLUDED.document, metadata = EXCLUDED.metadata, "
+            "embedding = EXCLUDED.embedding, updated_at = EXCLUDED.updated_at"
+        )
+        params = [
+            (
+                row["id"],
+                row["document"],
+                _json_dumps(row.get("metadata")),
+                _vector_literal(row["embedding"]),
+                row.get("updated_at") or _utcnow(),
+            )
+            for row in rows
+        ]
+        self._execute(sql, params, many=True)
+
+    def query_rows(
         self,
-        collection: str,
+        table: str,
         *,
         vector: list[float],
         limit: int,
-        qdrant_filter: Optional[dict],
-        with_vector: bool,
+        where: Optional[dict],
+        with_embedding: bool,
     ) -> list[dict]:
-        body = {
-            "query": vector,
-            "limit": int(limit),
-            "with_payload": True,
-            "with_vector": bool(with_vector),
-        }
-        if qdrant_filter:
-            body["filter"] = qdrant_filter
-        try:
-            response = self.request(
-                "POST",
-                f"/collections/{urlparse.quote(collection, safe='')}/points/query",
-                body=body,
-            )
-        except _QdrantHTTPError as exc:
-            if exc.status not in (404, 405):
-                raise
-            body = {
-                "vector": vector,
-                "limit": int(limit),
-                "with_payload": True,
-                "with_vector": bool(with_vector),
-            }
-            if qdrant_filter:
-                body["filter"] = qdrant_filter
-            response = self.request(
-                "POST",
-                f"/collections/{urlparse.quote(collection, safe='')}/points/search",
-                body=body,
-            )
-        result = response.get("result") or {}
-        if isinstance(result, list):
-            return result
-        return list(result.get("points") or [])
-
-    def scroll_points(
-        self,
-        collection: str,
-        *,
-        qdrant_filter: Optional[dict] = None,
-        limit: int = 256,
-        offset: Any = None,
-        with_vector: bool = False,
-    ) -> tuple[list[dict], Any]:
-        body: dict[str, Any] = {
-            "limit": int(limit),
-            "with_payload": True,
-            "with_vector": bool(with_vector),
-        }
-        if qdrant_filter:
-            body["filter"] = qdrant_filter
-        if offset is not None:
-            body["offset"] = offset
-        response = self.request(
-            "POST",
-            f"/collections/{urlparse.quote(collection, safe='')}/points/scroll",
-            body=body,
+        qi = _quote_identifier(table)
+        params: list = [_vector_literal(vector)]
+        where_sql = _where_to_sql(where, params) if where else "TRUE"
+        cols = "id, document, metadata"
+        if with_embedding:
+            cols += ", embedding"
+        params.append(int(limit))
+        # SQL text order — distance %s::vector, then WHERE params, then LIMIT %s
+        # — already matches positional binding order in ``params``.
+        sql = (
+            f"SELECT {cols}, embedding <=> %s::vector AS distance "
+            f"FROM {qi} WHERE {where_sql} ORDER BY distance ASC LIMIT %s"
         )
-        result = response.get("result") or {}
-        return list(result.get("points") or []), result.get("next_page_offset")
+        rows = self._execute(sql, params, fetch=True)
+        return [
+            self._row(record, with_embedding=with_embedding, with_distance=True)
+            for record in rows or []
+        ]
 
-    def delete_points(
+    def scroll_rows(
         self,
-        collection: str,
+        table: str,
         *,
-        point_ids: Optional[list[str]] = None,
-        qdrant_filter: Optional[dict] = None,
+        where: Optional[dict] = None,
+        with_embedding: bool = False,
+    ) -> list[dict]:
+        qi = _quote_identifier(table)
+        params: list = []
+        where_sql = _where_to_sql(where, params) if where else "TRUE"
+        cols = "id, document, metadata"
+        if with_embedding:
+            cols += ", embedding"
+        sql = f"SELECT {cols} FROM {qi} WHERE {where_sql}"
+        rows = self._execute(sql, params, fetch=True)
+        return [
+            self._row(record, with_embedding=with_embedding, with_distance=False)
+            for record in rows or []
+        ]
+
+    def delete_rows(
+        self,
+        table: str,
+        *,
+        ids: Optional[list[str]] = None,
+        where: Optional[dict] = None,
     ) -> None:
-        selector = (
-            {"points": point_ids or []}
-            if point_ids is not None
-            else {"filter": qdrant_filter or {}}
-        )
-        self.request(
-            "POST",
-            f"/collections/{urlparse.quote(collection, safe='')}/points/delete",
-            query={"wait": "true"},
-            body=selector,
-        )
+        qi = _quote_identifier(table)
+        if ids is not None:
+            self._execute(f"DELETE FROM {qi} WHERE id = ANY(%s)", [list(ids)])
+            return
+        params: list = []
+        where_sql = _where_to_sql(where, params) if where else "TRUE"
+        self._execute(f"DELETE FROM {qi} WHERE {where_sql}", params)
 
-    def count_points(self, collection: str) -> int:
-        response = self.request(
-            "POST",
-            f"/collections/{urlparse.quote(collection, safe='')}/points/count",
-            body={"exact": True},
-        )
-        result = response.get("result") or {}
-        return int(result.get("count") or 0)
+    def count_rows(self, table: str) -> int:
+        rows = self._execute(f"SELECT count(*) FROM {_quote_identifier(table)}", fetch=True)
+        return int(rows[0][0]) if rows and rows[0] else 0
 
-    def delete_collection(self, collection: str) -> None:
-        self.request("DELETE", f"/collections/{urlparse.quote(collection, safe='')}")
+    def drop_table(self, table: str) -> None:
+        self._execute(f"DROP TABLE IF EXISTS {_quote_identifier(table)}")
 
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:  # pragma: no cover - close best effort
+                    pass
+                self._conn = None
 
-def _condition(field: str, expression: Any) -> tuple[Optional[dict], list[dict]]:
-    key = f"{_PAYLOAD_METADATA}.{field}"
-    if isinstance(expression, dict):
-        conditions = []
-        must_not = []
-        for op, operand in expression.items():
-            if op == "$eq":
-                conditions.append({"key": key, "match": {"value": operand}})
-            elif op == "$ne":
-                must_not.append({"key": key, "match": {"value": operand}})
-            elif op == "$in":
-                conditions.append({"key": key, "match": {"any": operand or []}})
-            elif op == "$nin":
-                must_not.append({"key": key, "match": {"any": operand or []}})
-            elif op in ("$gt", "$gte", "$lt", "$lte"):
-                range_key = {"$gt": "gt", "$gte": "gte", "$lt": "lt", "$lte": "lte"}[op]
-                conditions.append({"key": key, "range": {range_key: operand}})
-            else:
-                return None, []
-        if len(conditions) == 1 and not must_not:
-            return conditions[0], []
-        body: dict[str, Any] = {}
-        if conditions:
-            body["must"] = conditions
-        if must_not:
-            body["must_not"] = must_not
-        return body, []
-    return {"key": key, "match": {"value": expression}}, []
+    @staticmethod
+    def _row(record, *, with_embedding: bool, with_distance: bool) -> dict:
+        record = list(record)
+        row = {
+            "id": str(record[0]),
+            "document": record[1] if record[1] is not None else "",
+            "metadata": record[2]
+            if isinstance(record[2], dict)
+            else (json.loads(record[2]) if record[2] else {}),
+            "embedding": None,
+            "distance": None,
+        }
+        idx = 3
+        if with_embedding:
+            row["embedding"] = _parse_vector(record[idx])
+            idx += 1
+        if with_distance:
+            row["distance"] = float(record[idx]) if record[idx] is not None else None
+        return row
 
 
-def _requires_local_filter(where: Optional[dict], where_document: Optional[dict] = None) -> bool:
-    if where_document:
-        return True
-    if not where:
-        return False
-    stack = [where]
-    while stack:
-        node = stack.pop()
-        if not isinstance(node, dict):
-            continue
-        for key, value in node.items():
-            if key in ("$or", "$contains"):
-                return True
-            if isinstance(value, dict):
-                if "$contains" in value:
-                    return True
-                stack.append(value)
-            elif isinstance(value, list):
-                stack.extend(item for item in value if isinstance(item, dict))
-    return False
-
-
-def _qdrant_filter(where: Optional[dict]) -> Optional[dict]:
-    if not where:
-        return None
-    _validate_where(where)
-    must = []
-    must_not = []
-    for key, expected in where.items():
-        if key == "$and":
-            for clause in expected or []:
-                child = _qdrant_filter(clause)
-                if child:
-                    must.append(child)
-            continue
-        if key == "$or":
-            return None
-        if key.startswith("$"):
-            return None
-        condition, not_conditions = _condition(key, expected)
-        if condition is None:
-            return None
-        must.append(condition)
-        must_not.extend(not_conditions)
-    out: dict[str, Any] = {}
-    if must:
-        out["must"] = must
-    if must_not:
-        out["must_not"] = must_not
-    return out or None
-
-
-def _combine_filters(*filters: Optional[dict]) -> Optional[dict]:
-    present = [flt for flt in filters if flt]
-    if not present:
-        return None
-    if len(present) == 1:
-        return present[0]
-    return {"must": present}
-
-
-def _text_any_filter(query: str) -> Optional[dict]:
-    tokens = _tokenize(query)
-    if not tokens:
-        return None
-    return {"must": [{"key": _PAYLOAD_DOCUMENT, "match": {"text_any": " ".join(tokens)}}]}
-
-
-class QdrantCollection(BaseCollection):
+class PgVectorCollection(BaseCollection):
     def __init__(
         self,
         *,
-        backend: "QdrantBackend",
-        client: _QdrantRESTClient,
-        config: _QdrantConfig,
+        backend: "PgVectorBackend",
+        client: _PgVectorClient,
+        config: _PgVectorConfig,
         palace: PalaceRef,
         collection_name: str,
-        remote_collection: str,
+        table: str,
     ):
         self._backend = backend
         self._client = client
         self._config = config
         self._palace = palace
         self._collection_name = collection_name
-        self._remote_collection = remote_collection
+        self._table = table
         self._lock = threading.RLock()
         self._closed = False
         self._known_dimension: Optional[int] = None
 
     def _ensure_open(self) -> None:
         if self._closed or self._backend._closed:
-            raise BackendClosedError("QdrantCollection has been closed")
+            raise BackendClosedError("PgVectorCollection has been closed")
 
-    def _remote_exists(self) -> bool:
-        return self._client.collection_exists(self._remote_collection)
+    def _table_exists(self) -> bool:
+        return self._client.table_exists(self._table)
 
     def _marker_exists(self) -> bool:
         return self._backend._marker_exists(self._palace)
 
-    def _remote_dimension(self) -> Optional[int]:
-        try:
-            info = self._client.get_collection_info(self._remote_collection)
-        except _QdrantHTTPError as exc:
-            if exc.status == 404:
-                return None
-            raise
-        result = info.get("result") or info
-        params = (result.get("config") or {}).get("params") or {}
-        vectors = params.get("vectors") or params.get("vectors_config") or {}
-        if isinstance(vectors, dict) and "size" in vectors:
-            return int(vectors["size"])
-        if isinstance(vectors, dict):
-            for value in vectors.values():
-                if isinstance(value, dict) and "size" in value:
-                    return int(value["size"])
-        return None
-
-    def _ensure_remote_collection(self, dimension: int) -> None:
+    def _ensure_table(self, dimension: int) -> None:
         if dimension <= 0:
             raise ValueError("embedding dimension must be positive")
         with self._lock:
@@ -687,117 +686,84 @@ class QdrantCollection(BaseCollection):
             if self._known_dimension is not None:
                 if self._known_dimension != dimension:
                     raise DimensionMismatchError(
-                        f"qdrant collection {self._collection_name!r} expects "
+                        f"pgvector collection {self._collection_name!r} expects "
                         f"embedding dimension {self._known_dimension}, got {dimension}"
                     )
                 return
-            if not self._remote_exists():
-                self._client.create_collection(self._remote_collection, dimension)
-                self._client.create_payload_index(
-                    self._remote_collection, _PAYLOAD_DOCUMENT, "text"
-                )
+            if not self._table_exists():
+                self._client.create_table(self._table, dimension)
                 self._known_dimension = dimension
                 return
-            remote_dim = self._remote_dimension()
-            if remote_dim is not None and remote_dim != dimension:
+            existing_dim = self._client.table_dimension(self._table)
+            if existing_dim is not None and existing_dim != dimension:
                 raise DimensionMismatchError(
-                    f"qdrant collection {self._collection_name!r} expects "
-                    f"embedding dimension {remote_dim}, got {dimension}"
+                    f"pgvector collection {self._collection_name!r} expects "
+                    f"embedding dimension {existing_dim}, got {dimension}"
                 )
-            self._known_dimension = remote_dim or dimension
+            self._known_dimension = existing_dim or dimension
 
-    def _scroll_all(
-        self,
-        *,
-        qdrant_filter: Optional[dict] = None,
-        with_vector: bool = False,
-    ) -> list[dict]:
+    def _scroll(self, *, where=None, with_embedding=False) -> list[dict]:
         self._ensure_open()
-        if not self._remote_exists():
+        if not self._table_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
             return []
-        rows = []
-        offset = None
-        while True:
-            points, offset = self._client.scroll_points(
-                self._remote_collection,
-                qdrant_filter=qdrant_filter,
-                limit=256,
-                offset=offset,
-                with_vector=with_vector,
-            )
-            rows.extend(_payload_row(point) for point in points)
-            if offset is None:
-                return rows
+        return self._client.scroll_rows(self._table, where=where, with_embedding=with_embedding)
 
     def _rows(
         self,
         *,
-        ids: Optional[list[str]] = None,
-        where: Optional[dict] = None,
-        where_document: Optional[dict] = None,
-        with_vector: bool = False,
+        ids=None,
+        where=None,
+        where_document=None,
+        with_embedding=False,
     ) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
-        q_filter = None if _requires_local_filter(where, where_document) else _qdrant_filter(where)
-        if ids is not None:
-            id_filter = {"must": [{"has_id": [_point_id(doc_id) for doc_id in ids]}]}
-            q_filter = _combine_filters(q_filter, id_filter)
-        rows = self._scroll_all(qdrant_filter=q_filter, with_vector=with_vector)
-        rows = [
+        pushdown = None if _requires_local_filter(where, where_document) else where
+        rows = self._scroll(where=pushdown, with_embedding=with_embedding)
+        id_set = set(ids) if ids is not None else None
+        return [
             row
             for row in rows
-            if (ids is None or row["id"] in set(ids))
+            if (id_set is None or row["id"] in id_set)
             and _matches_where(row["metadata"], where)
             and _matches_where_document(row["document"], where_document)
         ]
-        return rows
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_write_batch(
-            documents=documents,
-            ids=ids,
-            metadatas=metadatas,
-            embeddings=embeddings,
+            documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings
         )
         if embeddings is None:
-            raise ValueError("qdrant requires explicit embeddings")
+            raise ValueError("pgvector requires explicit embeddings")
         if len(set(ids)) != len(ids):
             raise ValueError("add ids must be unique")
         existing = self.get(ids=list(ids), include=[])
         if existing.ids:
-            raise ValueError(f"ids already exist in qdrant collection: {existing.ids}")
+            raise ValueError(f"ids already exist in pgvector collection: {existing.ids}")
         self.upsert(documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         _validate_write_batch(
-            documents=documents,
-            ids=ids,
-            metadatas=metadatas,
-            embeddings=embeddings,
+            documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings
         )
         if embeddings is None:
-            raise ValueError("qdrant requires explicit embeddings")
+            raise ValueError("pgvector requires explicit embeddings")
         vectors, dimension = _normalize_vectors(embeddings)
-        self._ensure_remote_collection(dimension)
+        self._ensure_table(dimension)
         metadatas = metadatas or [{} for _ in ids]
-        points = []
-        for doc_id, doc, meta, vector in zip(ids, documents, metadatas, vectors):
-            points.append(
-                {
-                    "id": _point_id(doc_id),
-                    "vector": vector,
-                    "payload": {
-                        _PAYLOAD_ID: str(doc_id),
-                        _PAYLOAD_DOCUMENT: str(doc),
-                        _PAYLOAD_METADATA: _jsonable_metadata(meta),
-                        "updated_at": _utcnow(),
-                    },
-                }
-            )
-        self._client.upsert_points(self._remote_collection, points)
+        rows = [
+            {
+                "id": str(doc_id),
+                "document": str(doc),
+                "metadata": _jsonable_metadata(meta),
+                "embedding": vector,
+                "updated_at": _utcnow(),
+            }
+            for doc_id, doc, meta, vector in zip(ids, documents, metadatas, vectors)
+        ]
+        self._client.upsert_rows(self._table, rows)
         self._backend._write_marker(self._palace, self._config)
 
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
@@ -817,10 +783,7 @@ class QdrantCollection(BaseCollection):
             for i, rid in enumerate(existing.ids)
             if existing.embeddings is not None
         }
-        out_ids = []
-        out_docs = []
-        out_metas = []
-        out_embeddings = []
+        out_ids, out_docs, out_metas, out_embeddings = [], [], [], []
         for idx, doc_id in enumerate(ids):
             if doc_id not in by_id:
                 continue
@@ -834,24 +797,15 @@ class QdrantCollection(BaseCollection):
             out_embeddings.append(embeddings[idx] if embeddings is not None else prev_embedding)
         if out_ids:
             self.upsert(
-                documents=out_docs,
-                ids=out_ids,
-                metadatas=out_metas,
-                embeddings=out_embeddings,
+                documents=out_docs, ids=out_ids, metadatas=out_metas, embeddings=out_embeddings
             )
 
     def _query_local_exact(
-        self,
-        *,
-        query_embeddings: list[list[float]],
-        n_results: int,
-        where: Optional[dict],
-        where_document: Optional[dict],
-        include: Optional[list[str]],
+        self, *, query_embeddings, n_results, where, where_document, include
     ) -> QueryResult:
         spec = _IncludeSpec.resolve(include, default_distances=True)
-        q_filter = None if _requires_local_filter(where, where_document) else _qdrant_filter(where)
-        rows = self._scroll_all(qdrant_filter=q_filter, with_vector=True)
+        pushdown = None if _requires_local_filter(where, where_document) else where
+        rows = self._scroll(where=pushdown, with_embedding=True)
         rows = [
             row
             for row in rows
@@ -897,7 +851,9 @@ class QdrantCollection(BaseCollection):
         include=None,
     ) -> QueryResult:
         if query_texts is not None:
-            raise ValueError("qdrant requires query_embeddings; use palace.get_collection wrapper")
+            raise ValueError(
+                "pgvector requires query_embeddings; use palace.get_collection wrapper"
+            )
         if query_embeddings is None:
             raise ValueError("query requires query_embeddings")
         if not query_embeddings:
@@ -912,16 +868,15 @@ class QdrantCollection(BaseCollection):
                 where_document=where_document,
                 include=include,
             )
-        if not self._remote_exists():
+        self._ensure_open()
+        if not self._table_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
             return QueryResult.empty(
                 num_queries=len(query_embeddings),
                 embeddings_requested=bool(include and "embeddings" in include),
             )
-
         spec = _IncludeSpec.resolve(include, default_distances=True)
-        q_filter = _qdrant_filter(where)
         outer_ids: list[list[str]] = []
         outer_docs: list[list[str]] = []
         outer_metas: list[list[dict]] = []
@@ -930,25 +885,26 @@ class QdrantCollection(BaseCollection):
         for query_vector in query_embeddings:
             q = _as_vector_array(query_vector)
             if self._known_dimension is None:
-                self._known_dimension = self._remote_dimension()
+                self._known_dimension = self._client.table_dimension(self._table)
             if self._known_dimension is not None and int(q.size) != self._known_dimension:
                 raise DimensionMismatchError(
-                    f"qdrant collection {self._collection_name!r} expects "
+                    f"pgvector collection {self._collection_name!r} expects "
                     f"embedding dimension {self._known_dimension}, got {int(q.size)}"
                 )
-            points = self._client.query_points(
-                self._remote_collection,
+            rows = self._client.query_rows(
+                self._table,
                 vector=q.astype(float).tolist(),
                 limit=n_results,
-                qdrant_filter=q_filter,
-                with_vector=spec.embeddings,
+                where=where,
+                with_embedding=spec.embeddings,
             )
-            rows = [_payload_row(point) for point in points]
             outer_ids.append([row["id"] for row in rows])
             outer_docs.append([row["document"] for row in rows] if spec.documents else [])
             outer_metas.append([row["metadata"] for row in rows] if spec.metadatas else [])
             outer_dists.append(
-                [_qdrant_score_to_distance(row["score"]) for row in rows] if spec.distances else []
+                [float(row["distance"]) if row["distance"] is not None else 1.0 for row in rows]
+                if spec.distances
+                else []
             )
             if spec.embeddings:
                 outer_embeds.append([row["embedding"] or [] for row in rows])
@@ -972,10 +928,7 @@ class QdrantCollection(BaseCollection):
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
         rows = self._rows(
-            ids=ids,
-            where=where,
-            where_document=where_document,
-            with_vector=spec.embeddings,
+            ids=ids, where=where, where_document=where_document, with_embedding=spec.embeddings
         )
         if ids is not None:
             by_id = {row["id"]: row for row in rows}
@@ -993,55 +946,32 @@ class QdrantCollection(BaseCollection):
 
     def delete(self, *, ids=None, where=None):
         _validate_where(where)
-        if not self._remote_exists():
+        if not self._table_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
             return
         if ids is not None and where is None:
-            self._client.delete_points(
-                self._remote_collection,
-                point_ids=[_point_id(doc_id) for doc_id in ids],
-            )
+            self._client.delete_rows(self._table, ids=list(ids))
             return
         if ids is None and where is not None and not _requires_local_filter(where):
-            q_filter = _qdrant_filter(where)
-            self._client.delete_points(self._remote_collection, qdrant_filter=q_filter)
+            self._client.delete_rows(self._table, where=where)
             return
         rows = self._rows(ids=ids, where=where)
         if rows:
-            self._client.delete_points(
-                self._remote_collection,
-                point_ids=[_point_id(row["id"]) for row in rows],
-            )
+            self._client.delete_rows(self._table, ids=[row["id"] for row in rows])
 
     def count(self) -> int:
         self._ensure_open()
-        if not self._remote_exists():
+        if not self._table_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
             return 0
-        return self._client.count_points(self._remote_collection)
+        return self._client.count_rows(self._table)
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         _validate_where(where)
-        q_filter = None if _requires_local_filter(where) else _qdrant_filter(where)
-        rows = []
-        text_filter = _text_any_filter(query)
-        text_filter_success = False
-        if text_filter:
-            try:
-                rows = self._scroll_all(
-                    qdrant_filter=_combine_filters(q_filter, text_filter),
-                    with_vector=False,
-                )
-                text_filter_success = True
-            except BackendError:
-                logger.debug(
-                    "Qdrant text filter failed; falling back to lexical scan", exc_info=True
-                )
-                rows = []
-        if not text_filter_success:
-            rows = self._scroll_all(qdrant_filter=q_filter, with_vector=False)
+        pushdown = None if _requires_local_filter(where) else where
+        rows = self._scroll(where=pushdown, with_embedding=False)
         rows = [row for row in rows if _matches_where(row["metadata"], where)]
         scores = _bm25_scores(query, [row["document"] for row in rows])
         hits = [
@@ -1064,15 +994,15 @@ class QdrantCollection(BaseCollection):
         if self._closed or self._backend._closed:
             return HealthStatus.unhealthy("collection closed")
         try:
-            if not self._client.collection_exists(self._remote_collection):
-                return HealthStatus.unhealthy("qdrant collection not found")
+            if not self._table_exists():
+                return HealthStatus.unhealthy("pgvector table not found")
         except Exception as exc:  # noqa: BLE001 - backend health should summarize
             return HealthStatus.unhealthy(str(exc))
         return HealthStatus.healthy()
 
 
-class QdrantBackend(BaseBackend):
-    name = "qdrant"
+class PgVectorBackend(BaseBackend):
+    name = "pgvector"
     capabilities = frozenset(
         {
             "requires_explicit_embeddings",
@@ -1087,11 +1017,14 @@ class QdrantBackend(BaseBackend):
     )
 
     def __init__(self):
-        self._clients: dict[_QdrantConfig, _QdrantRESTClient] = {}
-        self._collections_by_palace: dict[str, list[QdrantCollection]] = {}
+        self._clients: dict[_PgVectorConfig, _PgVectorClient] = {}
+        self._collections_by_palace: dict[str, list[PgVectorCollection]] = {}
         self._lock = threading.RLock()
         self._closed = False
 
+    # ------------------------------------------------------------------
+    # Marker / mismatch protection (mirrors the Qdrant local marker).
+    # ------------------------------------------------------------------
     @staticmethod
     def _marker_path(palace_path: str) -> str:
         return os.path.join(palace_path, _MARKER_FILENAME)
@@ -1100,20 +1033,44 @@ class QdrantBackend(BaseBackend):
     def _palace_hash(palace: PalaceRef) -> str:
         return sha256(palace.id.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
 
-    def _remote_collection_prefix(self, *, palace: PalaceRef, config: _QdrantConfig) -> str:
+    def _table_prefix(self, *, palace: PalaceRef, config: _PgVectorConfig) -> str:
         parts = ["mempalace"]
         if config.namespace:
             parts.append(_slug(config.namespace, "namespace"))
         parts.append(self._palace_hash(palace))
         return "_".join(parts)
 
-    def _marker_target(self, palace: PalaceRef, config: _QdrantConfig) -> dict:
+    def _table_name(
+        self, *, palace: PalaceRef, collection_name: str, config: _PgVectorConfig
+    ) -> str:
+        config = _PgVectorConfig(
+            dsn=config.dsn,
+            namespace=palace.namespace or config.namespace,
+        )
+        prefix = self._table_prefix(palace=palace, config=config)
+        return _pg_identifier(f"{prefix}_{_slug(collection_name, 'collection')}")
+
+    def _sanitized_dsn(self, dsn: str) -> dict:
+        try:
+            parsed = urlparse.urlparse(dsn)
+        except Exception:  # pragma: no cover - defensive
+            return {"raw": ""}
         return {
-            "url": config.url,
-            "namespace": config.namespace,
-            "palace_hash": self._palace_hash(palace),
-            "remote_prefix": self._remote_collection_prefix(palace=palace, config=config),
+            "host": parsed.hostname or "",
+            "port": parsed.port or 5432,
+            "dbname": (parsed.path or "").lstrip("/"),
         }
+
+    def _marker_target(self, palace: PalaceRef, config: _PgVectorConfig) -> dict:
+        target = self._sanitized_dsn(config.dsn)
+        target.update(
+            {
+                "namespace": config.namespace,
+                "palace_hash": self._palace_hash(palace),
+                "table_prefix": self._table_prefix(palace=palace, config=config),
+            }
+        )
+        return target
 
     def _marker_exists(self, palace: PalaceRef) -> bool:
         return bool(palace.local_path and os.path.isfile(self._marker_path(palace.local_path)))
@@ -1128,31 +1085,31 @@ class QdrantBackend(BaseBackend):
             with open(marker_path, encoding="utf-8") as f:
                 marker = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
-            raise BackendMismatchError(f"qdrant marker is unreadable: {marker_path}") from exc
+            raise BackendMismatchError(f"pgvector marker is unreadable: {marker_path}") from exc
         return marker if isinstance(marker, dict) else {}
 
-    def _validate_marker_target(self, palace: PalaceRef, config: _QdrantConfig) -> None:
+    def _validate_marker_target(self, palace: PalaceRef, config: _PgVectorConfig) -> None:
         marker = self._read_marker(palace)
         if marker is None:
             return
         if marker.get("backend") != self.name:
-            raise BackendMismatchError("qdrant marker does not identify the qdrant backend")
+            raise BackendMismatchError("pgvector marker does not identify the pgvector backend")
         expected = self._marker_target(palace, config)
-        actual = marker.get("qdrant")
+        actual = marker.get("pgvector")
         if not isinstance(actual, dict):
-            raise BackendMismatchError("qdrant marker is missing remote target metadata")
+            raise BackendMismatchError("pgvector marker is missing target metadata")
         mismatched = [
             key for key, expected_value in expected.items() if actual.get(key) != expected_value
         ]
         if mismatched:
             details = ", ".join(mismatched)
             raise BackendMismatchError(
-                "qdrant marker remote target does not match current configuration "
-                f"({details}); keep MEMPALACE_QDRANT_URL and namespace consistent "
+                "pgvector marker target does not match current configuration "
+                f"({details}); keep MEMPALACE_PGVECTOR_DSN and namespace consistent "
                 "or use a fresh palace directory"
             )
 
-    def _write_marker(self, palace: PalaceRef, config: _QdrantConfig) -> None:
+    def _write_marker(self, palace: PalaceRef, config: _PgVectorConfig) -> None:
         if not palace.local_path:
             return
         os.makedirs(palace.local_path, exist_ok=True)
@@ -1165,7 +1122,7 @@ class QdrantBackend(BaseBackend):
             "schema_version": 1,
             "created_at": _utcnow(),
             "palace_id": palace.id,
-            "qdrant": self._marker_target(palace, config),
+            "pgvector": self._marker_target(palace, config),
         }
         marker_path = self._marker_path(palace.local_path)
         with open(marker_path, "w", encoding="utf-8") as f:
@@ -1175,46 +1132,22 @@ class QdrantBackend(BaseBackend):
         except (OSError, NotImplementedError):
             pass
 
-    def _client(self, config: _QdrantConfig) -> _QdrantRESTClient:
+    # ------------------------------------------------------------------
+    def _client(self, config: _PgVectorConfig) -> _PgVectorClient:
         if self._closed:
-            raise BackendClosedError("QdrantBackend has been closed")
+            raise BackendClosedError("PgVectorBackend has been closed")
         with self._lock:
             client = self._clients.get(config)
             if client is None:
-                client = _QdrantRESTClient(config)
+                client = _PgVectorClient(config)
                 self._clients[config] = client
             return client
 
-    def _remote_collection_name(
-        self,
-        *,
-        palace: PalaceRef,
-        collection_name: str,
-        config: _QdrantConfig,
-    ) -> str:
-        config = _QdrantConfig(
-            url=config.url,
-            api_key=config.api_key,
-            timeout=config.timeout,
-            namespace=palace.namespace or config.namespace,
-        )
-        prefix = self._remote_collection_prefix(palace=palace, config=config)
-        return f"{prefix}_{_slug(collection_name, 'collection')}"
-
-    def get_collection(
-        self,
-        *args,
-        **kwargs,
-    ) -> QdrantCollection:
+    def get_collection(self, *args, **kwargs) -> PgVectorCollection:
         palace, collection_name, create, options = self._normalize_args(args, kwargs)
-        config = _QdrantConfig.from_options(options)
+        config = _PgVectorConfig.from_options(options)
         if palace.namespace and palace.namespace != config.namespace:
-            config = _QdrantConfig(
-                url=config.url,
-                api_key=config.api_key,
-                timeout=config.timeout,
-                namespace=palace.namespace,
-            )
+            config = _PgVectorConfig(dsn=config.dsn, namespace=palace.namespace)
         client = self._client(config)
         if palace.local_path:
             marker_path = self._marker_path(palace.local_path)
@@ -1223,31 +1156,26 @@ class QdrantBackend(BaseBackend):
             elif not create:
                 raise PalaceNotFoundError(marker_path)
         else:
-            # The qdrant marker is this backend's only mismatch-protection
-            # anchor, and it lives next to the palace on local disk. With no
-            # local_path (the pure-remote / hosted mode) we can neither write
-            # nor validate it, so opening would silently drop protection
-            # against URL/namespace drift. Refuse loudly instead. A remote
+            # The local marker is this backend's only mismatch-protection
+            # anchor. With no local_path (pure-remote / hosted mode) we can
+            # neither write nor validate it, so opening would silently drop
+            # protection against DSN/namespace drift. Refuse loudly. A remote
             # marker store for pure-remote palaces is tracked as a follow-up.
             raise BackendError(
-                "qdrant backend requires a local palace path to anchor mismatch "
+                "pgvector backend requires a local palace path to anchor mismatch "
                 "protection; pure-remote palaces (local_path=None) are not "
                 "supported yet"
             )
-        remote_collection = self._remote_collection_name(
-            palace=palace,
-            collection_name=collection_name,
-            config=config,
-        )
-        if not create and not client.collection_exists(remote_collection):
+        table = self._table_name(palace=palace, collection_name=collection_name, config=config)
+        if not create and not client.table_exists(table):
             raise CollectionNotInitializedError(collection_name)
-        collection = QdrantCollection(
+        collection = PgVectorCollection(
             backend=self,
             client=client,
             config=config,
             palace=palace,
             collection_name=collection_name,
-            remote_collection=remote_collection,
+            table=table,
         )
         with self._lock:
             self._collections_by_palace.setdefault(palace.id, []).append(collection)
@@ -1312,18 +1240,20 @@ class QdrantBackend(BaseBackend):
                 for palace_collections in self._collections_by_palace.values()
                 for collection in palace_collections
             ]
+            clients = list(self._clients.values())
             self._collections_by_palace.clear()
             self._clients.clear()
             self._closed = True
         for collection in collections:
             collection.close()
+        for client in clients:
+            client.close()
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
         if self._closed:
             return HealthStatus.unhealthy("backend closed")
         try:
-            client = self._client(_QdrantConfig.from_options())
-            client.request("GET", "/collections")
+            self._client(_PgVectorConfig.from_options()).ping()
         except Exception as exc:  # noqa: BLE001 - user-facing health status
             return HealthStatus.unhealthy(str(exc))
         if (
@@ -1331,14 +1261,14 @@ class QdrantBackend(BaseBackend):
             and palace.local_path
             and not os.path.isfile(self._marker_path(palace.local_path))
         ):
-            return HealthStatus.unhealthy("qdrant marker not found")
+            return HealthStatus.unhealthy("pgvector marker not found")
         return HealthStatus.healthy()
 
     @classmethod
     def detect(cls, path: str) -> bool:
         return os.path.isfile(os.path.join(path, _MARKER_FILENAME))
 
-    def create_collection(self, palace_path: str, collection_name: str) -> QdrantCollection:
+    def create_collection(self, palace_path: str, collection_name: str) -> PgVectorCollection:
         return self.get_collection(palace_path, collection_name, create=True)
 
     def get_or_create_collection(self, palace_path: str, collection_name: str):
@@ -1346,15 +1276,6 @@ class QdrantBackend(BaseBackend):
 
     def delete_collection(self, palace_path: str, collection_name: str) -> None:
         palace = PalaceRef(id=palace_path, local_path=palace_path)
-        config = _QdrantConfig.from_options()
-        remote_collection = self._remote_collection_name(
-            palace=palace,
-            collection_name=collection_name,
-            config=config,
-        )
-        client = self._client(config)
-        if client.collection_exists(remote_collection):
-            client.delete_collection(remote_collection)
-
-
-__all__ = ["QdrantBackend", "QdrantCollection"]
+        config = _PgVectorConfig.from_options()
+        table = self._table_name(palace=palace, collection_name=collection_name, config=config)
+        self._client(config).drop_table(table)
