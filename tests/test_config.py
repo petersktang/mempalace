@@ -196,6 +196,16 @@ def test_normalize_wing_name_mixed():
     assert normalize_wing_name("My-Cool App") == "my_cool_app"
 
 
+def test_normalize_wing_name_strips_leading_separator():
+    # Claude Code path-encoded project dirs begin with a separator; the slug
+    # must not start with "_" or sanitize_name / MCP writes would reject it.
+    assert normalize_wing_name("-home-user-linux-book") == "home_user_linux_book"
+
+
+def test_normalize_wing_name_strips_trailing_separator():
+    assert normalize_wing_name("project-") == "project"
+
+
 # --- sanitize_name ---
 
 

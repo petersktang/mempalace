@@ -37,8 +37,13 @@ def normalize_wing_name(name: str) -> str:
     The same rule is applied by ``init`` when persisting `topics_by_wing`
     and when writing `mempalace.yaml`, so the miner's lookup matches at
     mine time regardless of the source dirname.
+
+    Leading/trailing separators are stripped so a path-encoded dirname like
+    ``-home-user-proj`` yields ``home_user_proj`` rather than a leading-
+    underscore slug that ``sanitize_name`` (and thus the MCP write tools)
+    would reject.
     """
-    return name.lower().replace(" ", "_").replace("-", "_")
+    return name.lower().replace(" ", "_").replace("-", "_").strip("_")
 
 
 def sanitize_name(value: str, field_name: str = "name") -> str:

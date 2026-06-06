@@ -9,6 +9,7 @@ import chromadb
 import pytest
 import yaml
 
+from mempalace.config import normalize_wing_name
 from mempalace.miner import detect_room, load_config, mine, scan_project, status
 from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
 
@@ -257,7 +258,12 @@ def test_load_config_uses_defaults_when_yaml_missing():
         assert isinstance(config, dict)
         assert "wing" in config
         assert "rooms" in config
-        assert config["wing"] == project_root.name
+        # The default wing is the normalized dirname, not the raw name: temp
+        # dir names can contain leading/trailing '_' (tempfile's alphabet
+        # includes it), which normalize_wing_name strips. Comparing to the raw
+        # name was flaky across platforms (it only passed when the random name
+        # had no separators).
+        assert config["wing"] == normalize_wing_name(project_root.name)
     finally:
         shutil.rmtree(tmpdir)
 
