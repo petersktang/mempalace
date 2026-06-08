@@ -319,6 +319,30 @@ Delete an explicit tunnel by its ID.
 
 ---
 
+### `mempalace_list_hallways`
+
+List within-wing hallway records (entity-to-entity co-occurrence links built at mine time). Optionally filter by wing.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `wing` | string | No | Filter hallways by wing |
+
+**Returns:** `[ { id, wing, entity_a, entity_b, co_occurrence_count, rooms, ... }, ... ]`
+
+---
+
+### `mempalace_delete_hallway`
+
+Delete a hallway record by its ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `hallway_id` | string | **Yes** | Hallway ID to delete |
+
+**Returns:** `{ deleted: bool }`
+
+---
+
 ### `mempalace_follow_tunnels`
 
 Follow tunnels from a room to see what it connects to in other wings. Returns connected rooms with drawer previews.
