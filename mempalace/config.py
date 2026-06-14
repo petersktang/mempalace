@@ -333,6 +333,18 @@ class MempalaceConfig:
         return os.path.join(os.path.dirname(self.palace_path), "tunnels.json")
 
     @property
+    def hallway_file(self):
+        """Path to the hallway file, sibling of palace_path.
+
+        Mirrors ``tunnel_file`` so within-wing hallway state is scoped to the
+        configured palace and survives palace rebuilds (it does not live in
+        ChromaDB which can be recreated). Prior to this property the path was
+        hardcoded under ``~/.mempalace/hallways.json`` and multiple palaces on
+        one host silently shared one file (see ``hallways._legacy_hallway_file``).
+        """
+        return os.path.join(os.path.dirname(self.palace_path), "hallways.json")
+
+    @property
     def collection_name(self):
         """ChromaDB collection name."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)

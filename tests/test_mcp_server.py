@@ -1515,11 +1515,16 @@ class TestWriteTools:
     # ── hallway MCP tools (mirror the tunnel pattern) ──
 
     def _seed_hallways(self, monkeypatch, tmp_path):
-        """Point hallways._HALLWAY_FILE at a tmp file and seed two records."""
+        """Point hallways resolvers at a tmp file and seed two records."""
         from mempalace import hallways
 
         hallway_file = tmp_path / "hallways.json"
-        monkeypatch.setattr(hallways, "_HALLWAY_FILE", str(hallway_file))
+        monkeypatch.setattr(hallways, "_get_hallway_file", lambda *a, **kw: str(hallway_file))
+        monkeypatch.setattr(
+            hallways,
+            "_legacy_hallway_file",
+            lambda: str(tmp_path / "legacy-hallways.json"),
+        )
         seeded = [
             {
                 "id": "hallway_wing_a_X_Y_aaaa",
