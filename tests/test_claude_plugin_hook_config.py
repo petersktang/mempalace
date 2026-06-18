@@ -94,6 +94,7 @@ def test_session_end_hook_runs_precompact_mine(hook_config: dict) -> None:
     events = hook_config.get("hooks", {})
 
     assert "SessionEnd" in events
+    assert "PreCompact" in events
     assert events["SessionEnd"] == events["PreCompact"]
 
     commands = [
