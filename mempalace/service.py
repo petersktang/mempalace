@@ -283,8 +283,8 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     print(f"{'-' * 55}\n")
 
     try:
-        from .mcp_server import _wal_log
         from .sync import sync_palace
+        from .wal import _wal_log
 
         report = sync_palace(
             palace_path=palace_path,
@@ -379,7 +379,12 @@ def run_mcp_tool(payload: dict[str, Any]) -> dict[str, Any]:
         return {"success": False, "error": f"unknown MCP tool: {name}", "exit_code": 2}
     result = TOOLS[name]["handler"](**arguments)
     if isinstance(result, dict):
-        result.setdefault("success", True)
+        # Several write tools signal failure with a bare {"error": ...} and no
+        # explicit success flag (e.g. tool_create_tunnel / tool_delete_tunnel
+        # validation paths). Infer failure from the "error" key so the daemon
+        # does not persist a failed write as succeeded with exit_code 0.
+        if "success" not in result:
+            result["success"] = "error" not in result
         result.setdefault("exit_code", 0 if result.get("success") else 1)
         return result
     return {"success": True, "value": result, "exit_code": 0}

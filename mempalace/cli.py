@@ -692,8 +692,8 @@ def cmd_sync(args):
         _submit_daemon_cli_job("sync", payload, args, background=getattr(args, "background", False))
         return
 
-    from .mcp_server import _wal_log
     from .palace import MineAlreadyRunning
+    from .wal import _wal_log
     from .backends import detect_backend_for_path
     from .palace import _backend_artifact_label, resolve_backend_name
     from .sync import sync_palace

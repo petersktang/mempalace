@@ -1189,12 +1189,12 @@ class TestSearchTool:
 
     def test_wal_redacts_sensitive_fields(self, monkeypatch, config, kg, tmp_path):
         _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace import mcp_server
+        from mempalace import wal
 
         wal_file = tmp_path / "write_log.jsonl"
-        monkeypatch.setattr(mcp_server, "_WAL_FILE", wal_file)
+        monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
 
-        mcp_server._wal_log(
+        wal._wal_log(
             "test",
             {"content": "secret note", "query": "private search", "safe": "ok"},
         )
@@ -2932,13 +2932,13 @@ class TestImportKillSwitchSafety:
         Proves the deferred setup still works (defers WAL creation to write
         time, does not disable it) and preserves the WAL permission bits.
         """
-        from mempalace import mcp_server
+        from mempalace import wal
 
         wal_file = tmp_path / "fresh" / "wal" / "write_log.jsonl"
         assert not wal_file.parent.exists()
-        monkeypatch.setattr(mcp_server, "_WAL_FILE", wal_file)
+        monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
 
-        mcp_server._wal_log("test_op", {"safe": "ok"})
+        wal._wal_log("test_op", {"safe": "ok"})
 
         assert wal_file.exists(), "lazy WAL init did not create the log on first write"
         entry = json.loads(wal_file.read_text().strip())

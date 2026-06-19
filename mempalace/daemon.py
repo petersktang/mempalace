@@ -32,6 +32,11 @@ from .config import MempalaceConfig
 HOST = "127.0.0.1"
 STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
 DEFAULT_WAIT_TIMEOUT = 60.0 * 60.0
+# Liveness-probe timeout for the hook "is a daemon already running?" precheck.
+# Kept well under the ~500ms hook budget so a wedged daemon can't stall the hook
+# (it falls back to the direct/spawn path instead). A healthy local daemon
+# answers /health in single-digit ms, so this rarely false-negatives.
+HOOK_PROBE_TIMEOUT = 0.5
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
 MAX_ATTEMPTS = 3
 MAX_BODY_BYTES = 1 << 20  # 1 MiB cap on request bodies (auth-gated DoS guard)
@@ -272,8 +277,15 @@ class QueueStore:
                 "ON jobs(dedupe_key) WHERE state IN ('queued', 'running')"
             )
         # The queue DB holds verbatim payloads (diary text, source paths) — lock it
-        # down to owner-only regardless of the invoking user's umask.
+        # down to owner-only regardless of the invoking user's umask. The WAL/SHM
+        # sidecars carry the same un-checkpointed payloads, so harden them too when
+        # present (the daemon also runs under a 0o077 umask; this covers any
+        # QueueStore opened outside that scope, e.g. the CLI `daemon jobs` path).
         _chmod_private(self.path)
+        for sidecar_suffix in ("-wal", "-shm"):
+            sidecar = self.path.with_name(self.path.name + sidecar_suffix)
+            if sidecar.exists():
+                _chmod_private(sidecar)
 
     def prune_terminal(self, older_than_days: int = JOB_RETENTION_DAYS) -> int:
         """Delete terminal (succeeded/failed/cancelled) jobs older than the
@@ -632,6 +644,13 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
     if backend:
         os.environ["MEMPALACE_BACKEND_EXPLICIT"] = backend
         os.environ["MEMPALACE_BACKEND"] = backend
+    # Privacy by architecture: tighten the umask to owner-only BEFORE the queue
+    # DB is created. SQLite's WAL/SHM sidecars hold un-checkpointed verbatim
+    # payloads and are (re)created with the process umask on every open/close
+    # cycle, so the umask must already be tight when DaemonRuntime builds the
+    # QueueStore (its _init_db opens the DB in WAL mode) — not only once the HTTP
+    # server starts. Restored in the finally at the end of run_server.
+    prev_umask = os.umask(0o077)
     token = ensure_token(palace_path)
     runtime = DaemonRuntime(palace_path, backend=backend)
 
@@ -651,6 +670,11 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
 
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or "0")
+            # Reject a negative Content-Length explicitly: self.rfile.read(-1)
+            # would read until the client closes the connection, blocking the
+            # worker and bypassing the MAX_BODY_BYTES cap (an auth-gated DoS).
+            if length < 0:
+                raise ValueError("invalid Content-Length")
             if length > MAX_BODY_BYTES:
                 raise ValueError("request body too large")
             raw = self.rfile.read(length)
@@ -755,10 +779,9 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
             self.server_name = host
             self.server_port = port
 
-    # Privacy by architecture: the queue DB holds verbatim user content (diary
-    # entries, source paths). Force owner-only perms on every file this process
-    # creates — queue.sqlite3, its WAL/SHM sidecars, and any future artifact.
-    prev_umask = os.umask(0o077)
+    # The owner-only umask set above (before DaemonRuntime built the queue DB)
+    # covers every file this process creates — queue.sqlite3, its WAL/SHM
+    # sidecars, and any future artifact — and is restored in the finally below.
     try:
         with _Server((HOST, port), _Handler) as httpd:
             actual_port = int(httpd.server_address[1])
@@ -889,8 +912,8 @@ class DaemonClient:
             # that only know how to handle DaemonError.
             raise DaemonError(f"daemon returned non-JSON response: {raw[:200]!r}") from exc
 
-    def health(self) -> dict[str, Any]:
-        return self.request("GET", "/health")
+    def health(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        return self.request("GET", "/health", timeout=timeout)
 
     def submit(
         self,
@@ -926,10 +949,14 @@ class DaemonClient:
         return self.request("POST", "/shutdown", {})
 
 
-def get_client_if_running(palace_path: str) -> DaemonClient | None:
+def get_client_if_running(palace_path: str, *, health_timeout: float = 5.0) -> DaemonClient | None:
+    # health_timeout bounds the liveness probe. Hook callers (subject to the
+    # ~500ms hook budget) pass a short value via HOOK_PROBE_TIMEOUT so a wedged
+    # daemon — endpoint present, HTTP server not answering — can't stall the
+    # hook for the default 5s before it falls back to the direct path.
     try:
         client = DaemonClient(palace_path)
-        client.health()
+        client.health(timeout=health_timeout)
         return client
     except DaemonError:
         return None

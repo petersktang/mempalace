@@ -533,10 +533,13 @@ def _daemon_available() -> bool:
     explicitly via `mempalace daemon start`; when it isn't up, hooks fall back
     to the existing direct (in-process / spawn) path instead of blocking.
     """
-    from .daemon import get_client_if_running
+    from .daemon import HOOK_PROBE_TIMEOUT, get_client_if_running
 
     try:
-        return get_client_if_running(MempalaceConfig().palace_path) is not None
+        return (
+            get_client_if_running(MempalaceConfig().palace_path, health_timeout=HOOK_PROBE_TIMEOUT)
+            is not None
+        )
     except Exception:
         return False
 

@@ -748,3 +748,109 @@ def test_run_sync_structured_errors_on_sync_failures(tmp_path, monkeypatch):
     r = service.run_sync({"palace_path": str(palace), "dry_run": True})
     assert r["success"] is False
     assert "sync failed" in r["error"]
+
+
+# --- post-merge review follow-ups (Copilot review on #1826) ---
+
+
+@_posix_only_perms
+def test_run_server_tightens_umask_before_building_queue(tmp_path, monkeypatch):
+    """The owner-only umask must be active BEFORE the queue DB is built.
+
+    SQLite's WAL/SHM sidecars hold un-checkpointed verbatim payloads and are
+    created with the process umask, so a loose umask at DaemonRuntime/QueueStore
+    construction time would leave them world-readable. Capture the umask at the
+    moment DaemonRuntime is constructed and assert it is already 0o077.
+    """
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    captured = {}
+
+    def _spy_runtime(*args, **kwargs):
+        current = os.umask(0o022)
+        os.umask(current)  # restore without changing
+        captured["umask"] = current
+        raise RuntimeError("stop before binding a real socket")
+
+    monkeypatch.setattr(daemon, "DaemonRuntime", _spy_runtime)
+    with pytest.raises(RuntimeError):
+        daemon.run_server(str(palace), port=0)
+    assert captured["umask"] == 0o077
+
+
+def test_negative_content_length_is_rejected_without_blocking(tmp_path, monkeypatch):
+    """A POST with Content-Length: -1 must get a prompt 400, not hang the worker.
+
+    rfile.read(-1) would read until the client closes the socket (an auth-gated
+    DoS) and bypass the MAX_BODY_BYTES cap. The recv timeout below turns a
+    regression into a failure instead of a hang.
+    """
+    import socket
+
+    client, thread, palace, holders = _start_server(
+        tmp_path, monkeypatch, lambda k, p: {"success": True}
+    )
+    try:
+        sock = socket.create_connection((client.host, client.port), timeout=5)
+        sock.settimeout(5)
+        request = (
+            "POST /jobs HTTP/1.1\r\n"
+            "Host: daemon\r\n"
+            f"Authorization: Bearer {client.token}\r\n"
+            "Content-Length: -1\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        sock.sendall(request.encode("ascii"))
+        status_line = sock.recv(4096).decode("latin-1").split("\r\n", 1)[0]
+        sock.close()
+        assert "400" in status_line, f"expected 400, got {status_line!r}"
+    finally:
+        _stop_server(client, thread, holders)
+
+
+def test_run_mcp_tool_marks_bare_error_dict_as_failure(monkeypatch):
+    """A write tool that returns {"error": ...} with no success flag must be
+    recorded as a failed job, not succeeded (Copilot review)."""
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+
+    monkeypatch.setattr(
+        mcp,
+        "TOOLS",
+        {"mempalace_create_tunnel": {"handler": lambda **kw: {"error": "bad endpoint"}}},
+    )
+    out = service.run_mcp_tool({"name": "mempalace_create_tunnel", "arguments": {}})
+    assert out["success"] is False
+    assert out["exit_code"] == 1
+    assert out["error"] == "bad endpoint"
+
+    # A result with neither an explicit success flag nor an error is a success.
+    monkeypatch.setattr(
+        mcp, "TOOLS", {"mempalace_create_tunnel": {"handler": lambda **kw: {"tunnel_id": "t1"}}}
+    )
+    out = service.run_mcp_tool({"name": "mempalace_create_tunnel", "arguments": {}})
+    assert out["success"] is True
+    assert out["exit_code"] == 0
+
+
+def test_get_client_if_running_uses_short_probe_timeout(monkeypatch):
+    """The hook liveness precheck must pass a short health timeout so a wedged
+    daemon can't stall the hook past its budget (Copilot review)."""
+    captured = {}
+
+    class _FakeClient:
+        def __init__(self, palace_path):
+            pass
+
+        def health(self, *, timeout):
+            captured["timeout"] = timeout
+            return {"ok": True}
+
+    monkeypatch.setattr(daemon, "DaemonClient", _FakeClient)
+
+    assert daemon.HOOK_PROBE_TIMEOUT <= 0.5
+    client = daemon.get_client_if_running("/p", health_timeout=daemon.HOOK_PROBE_TIMEOUT)
+    assert client is not None
+    assert captured["timeout"] == daemon.HOOK_PROBE_TIMEOUT

@@ -1355,16 +1355,16 @@ class TestSyncCli:
     def test_cli_emits_wal_on_apply(self, monkeypatch, synced_world):
         """F8 regression: cmd_sync must wire `_wal_log` so CLI deletes are
         audited. Without this, scripted CLI invocations leave no trail."""
-        from mempalace import cli, mcp_server
+        from mempalace import cli, wal
 
         seen = []
-        original = mcp_server._wal_log
+        original = wal._wal_log
 
         def recording_wal(operation, params, result=None):
             seen.append((operation, params, result))
             original(operation, params, result)
 
-        monkeypatch.setattr(mcp_server, "_wal_log", recording_wal)
+        monkeypatch.setattr(wal, "_wal_log", recording_wal)
 
         argv = [
             "mempalace",
