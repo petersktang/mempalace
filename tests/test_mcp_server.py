@@ -4067,3 +4067,31 @@ def test_refresh_sqlite_integrity_status_records_quick_check_errors(monkeypatch)
     assert mcp_server._sqlite_integrity_checked is True
     assert len(mcp_server._sqlite_integrity_errors) == 1
     assert "malformed inverted index" in mcp_server._sqlite_integrity_errors[0]
+
+
+def test_sqlite_integrity_refusal_handles_none_palace_path(monkeypatch):
+    """
+    Regression test for Gemini review feedback on PR #1823 (lines 433-455).
+
+    _mcp_sqlite_integrity_refusal() must not raise TypeError when
+    _config.palace_path is None — os.path.join(None, "chroma.sqlite3")
+    would otherwise crash the server on every mutating tool call while
+    the palace is unconfigured and integrity errors are present.
+    """
+    from mempalace import mcp_server
+
+    # palace_path is a read-only @property on MempalaceConfig (no setter),
+    # so monkeypatch.setattr on the instance fails. Patch the class-level
+    # property instead -- monkeypatch restores it automatically on teardown.
+    monkeypatch.setattr(type(mcp_server._config), "palace_path", property(lambda self: None))
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", ["malformed inverted index"])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    # Must not raise
+    result = mcp_server._mcp_sqlite_integrity_refusal(req_id=1, tool_name="mempalace_kg_add")
+
+    assert result is not None
+    assert result["error"]["data"]["palace"] == ""
+    assert result["error"]["data"]["sqlite_path"] == ""
+    assert result["error"]["data"]["tool"] == "mempalace_kg_add"

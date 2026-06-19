@@ -446,8 +446,12 @@ def _mcp_sqlite_integrity_refusal(req_id, tool_name: str):
             ),
             "data": {
                 "tool": tool_name,
-                "palace": _config.palace_path,
-                "sqlite_path": os.path.join(_config.palace_path, "chroma.sqlite3"),
+                "palace": _config.palace_path or "",
+                "sqlite_path": (
+                    os.path.join(_config.palace_path, "chroma.sqlite3")
+                    if _config.palace_path
+                    else ""
+                ),
                 "errors": _sqlite_integrity_errors[:10],
                 "error_count": len(_sqlite_integrity_errors),
                 "hint": (
