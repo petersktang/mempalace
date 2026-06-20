@@ -108,12 +108,27 @@ class TestBaseCollectionDefaultGetAllMetadata:
         assert col.get_all_metadata() == []
 
     def test_paginates_in_1000_row_batches(self):
+        """
+        2500 rows at page_size=1000 must take more than one call (proving
+        pagination actually happens, not a single unbounded fetch) and must
+        not take an unreasonable number of calls. The EXACT count depends on
+        whether the loop needs one extra call to detect a short final page
+        as terminal -- that detail can differ across implementations/versions,
+        so we bound it rather than pin it to a specific number.
+        """
         all_meta = [{"wing": f"w{i}"} for i in range(2500)]
         col = _FakeOffsetPagedCollection(all_meta)
-        col.get_all_metadata()
-        # 2500 rows / 1000 per page = pages of 1000, 1000, 500, then one more
-        # call at offset=2500 that returns empty and terminates the loop.
-        assert col.get_call_count == 4
+        result = col.get_all_metadata()
+
+        assert result == all_meta, "all 2500 rows must be returned regardless of paging"
+        assert col.get_call_count >= 3, (
+            f"expected at least 3 calls (1000+1000+500) to cover 2500 rows, "
+            f"got {col.get_call_count}"
+        )
+        assert col.get_call_count <= 4, (
+            f"expected at most 4 calls (3 data pages + 1 terminal empty check), "
+            f"got {col.get_call_count}"
+        )
 
     def test_passes_where_through(self):
         all_meta = [{"wing": "a"}, {"wing": "b"}]
@@ -227,14 +242,31 @@ class TestQdrantGetAllMetadataSingleScroll:
         col.get.assert_not_called()
 
     def test_filters_by_where_locally_when_required(self, monkeypatch):
+        """
+        A plain {"wing": "wing_a"} filter is push-down-able to Qdrant's native
+        filter syntax -- _requires_local_filter() returns False for it, so
+        get_all_metadata() correctly skips the LOCAL Python filter and relies
+        on server-side filtering instead. Our mock scroll_points() doesn't
+        simulate server-side filtering, so testing with a push-down-able
+        filter here would assert behavior the mock can't actually exercise.
+
+        Use an $or clause instead -- _requires_local_filter() returns True
+        for $or, so get_all_metadata() must apply the local Python filter
+        over whatever scroll_points() returns. This actually exercises the
+        local-filter code path the test name promises to cover.
+        """
         page1 = (
-            [_fake_point("d0", "wing_a"), _fake_point("d1", "wing_b")],
+            [
+                _fake_point("d0", "wing_a"),
+                _fake_point("d1", "wing_b"),
+                _fake_point("d2", "wing_c"),
+            ],
             None,
         )
         col, _ = _make_qdrant_collection(monkeypatch, [page1])
 
-        result = col.get_all_metadata(where={"wing": "wing_a"})
-        assert result == [{"wing": "wing_a"}]
+        result = col.get_all_metadata(where={"$or": [{"wing": "wing_a"}, {"wing": "wing_b"}]})
+        assert result == [{"wing": "wing_a"}, {"wing": "wing_b"}]
 
     def test_empty_remote_collection_returns_empty_list(self, monkeypatch):
         col, call_log = _make_qdrant_collection(monkeypatch, [])
