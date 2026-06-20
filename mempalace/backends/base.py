@@ -496,6 +496,8 @@ class BaseCollection(ABC):
             if not batch_meta:
                 break
             all_meta.extend(batch_meta)
+            if len(batch_meta) < page_size:
+                break
             offset += len(batch_meta)
         return all_meta
 

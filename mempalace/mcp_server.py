@@ -862,7 +862,7 @@ def _fetch_all_metadata(col, where=None):
     """
     get_all = getattr(col, "get_all_metadata", None)
     if callable(get_all):
-        return get_all(where=where) if where else get_all()
+        return get_all(where=where)
 
     # Defensive fallback for any collection object that predates the
     # get_all_metadata() contract method (e.g. a third-party backend not yet

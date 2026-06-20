@@ -1020,9 +1020,10 @@ class QdrantCollection(BaseCollection):
         issue #1796.
         """
         _validate_where(where)
-        q_filter = None if _requires_local_filter(where) else _qdrant_filter(where)
+        local_filter = _requires_local_filter(where)
+        q_filter = None if local_filter else _qdrant_filter(where)
         rows = self._scroll_all(qdrant_filter=q_filter, with_vector=False)
-        if where:
+        if where and local_filter:
             rows = [row for row in rows if _matches_where(row["metadata"], where)]
         return [row["metadata"] for row in rows]
 
