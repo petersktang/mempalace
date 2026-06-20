@@ -845,6 +845,35 @@ class TestReadTools:
         assert result["taxonomy"]["project"]["frontend"] == 1
         assert result["taxonomy"]["notes"]["planning"] == 1
 
+    def test_overview_tools_use_sqlite_fast_path(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Overview tools must answer from the sqlite cross-tab without paging
+        all metadata through the chroma client (#1748 / #1379). A tripwire on
+        the pagination helper fails loudly if the fast path regresses to the
+        slow client path that times out on large palaces."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        def _boom(*_a, **_k):
+            raise AssertionError("pagination path used instead of sqlite fast path")
+
+        monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+        monkeypatch.setattr(mcp_server, "_fetch_all_metadata", _boom)
+
+        status = mcp_server.tool_status()
+        assert status["total_drawers"] == 4
+        assert status["wings"] == {"project": 3, "notes": 1}
+
+        assert mcp_server.tool_list_wings()["wings"] == {"project": 3, "notes": 1}
+
+        rooms = mcp_server.tool_list_rooms(wing="project")["rooms"]
+        assert rooms == {"backend": 2, "frontend": 1}
+
+        tax = mcp_server.tool_get_taxonomy()["taxonomy"]
+        assert tax["project"] == {"backend": 2, "frontend": 1}
+        assert tax["notes"] == {"planning": 1}
+
     def test_no_palace_returns_error(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_status

@@ -973,6 +973,29 @@ def _tool_status_via_sqlite() -> dict:
     return result
 
 
+def _sqlite_taxonomy():
+    """Fast wing→room tally straight from ``chroma.sqlite3`` (#1748 / #1379).
+
+    Returns ``(total, {wing: {room: count}})`` or ``None`` to signal the
+    caller to fall back to the ChromaDB client pagination path. ``None`` means
+    a non-chroma backend, a missing/unbootstrapped palace, or a sqlite error —
+    exactly the cases ``backends.chroma._sqlite_wing_room_counts`` already
+    handles for the CLI ``miner.status()``. The point is to answer the
+    overview tools from the relational metadata without cold-loading the HNSW
+    index, which costs tens of seconds per call on large palaces and is what
+    times them out under the MCP host limit.
+    """
+    if not _is_chroma_backend():
+        return None
+    try:
+        from .backends.chroma import _sqlite_wing_room_counts
+
+        return _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+    except Exception:
+        logger.debug("sqlite taxonomy fast path failed; falling back", exc_info=True)
+        return None
+
+
 def tool_status():
     # Run the safe sqlite/pickle probe before we touch chromadb. In the
     # #1222 failure mode, opening the persistent client to call .count()
@@ -983,6 +1006,29 @@ def tool_status():
 
     if _vector_disabled:
         return _tool_status_via_sqlite()
+
+    # Fast path: tally wing/room straight from sqlite so overview tools stay
+    # responsive on large palaces instead of cold-loading the HNSW index or
+    # paging hundreds of MB of metadata through the client (#1748 / #1379).
+    # ``None`` (non-chroma backend / non-standard layout) falls through to the
+    # client path below.
+    fast = _sqlite_taxonomy()
+    if fast is not None:
+        total, wing_rooms = fast
+        wings = {}
+        rooms = {}
+        for w, room_counts in wing_rooms.items():
+            wings[w] = wings.get(w, 0) + sum(room_counts.values())
+            for r, n in room_counts.items():
+                rooms[r] = rooms.get(r, 0) + n
+        return {
+            "total_drawers": total,
+            "wings": wings,
+            "rooms": rooms,
+            "protocol": PALACE_PROTOCOL,
+            "aaak_dialect": AAAK_SPEC,
+            "backend": _selected_backend_name(),
+        }
 
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
@@ -1050,6 +1096,13 @@ When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 
 
 def tool_list_wings():
+    fast = _sqlite_taxonomy()
+    if fast is not None:
+        _total, wing_rooms = fast
+        wings = {}
+        for w, room_counts in wing_rooms.items():
+            wings[w] = wings.get(w, 0) + sum(room_counts.values())
+        return {"wings": wings}
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -1073,6 +1126,16 @@ def tool_list_rooms(wing: str = None):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
+    fast = _sqlite_taxonomy()
+    if fast is not None:
+        _total, wing_rooms = fast
+        rooms = {}
+        for w, room_counts in wing_rooms.items():
+            if wing and w != wing:
+                continue
+            for r, n in room_counts.items():
+                rooms[r] = rooms.get(r, 0) + n
+        return {"wing": wing or "all", "rooms": rooms}
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -1093,6 +1156,10 @@ def tool_list_rooms(wing: str = None):
 
 
 def tool_get_taxonomy():
+    fast = _sqlite_taxonomy()
+    if fast is not None:
+        _total, wing_rooms = fast
+        return {"taxonomy": {w: dict(room_counts) for w, room_counts in wing_rooms.items()}}
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
