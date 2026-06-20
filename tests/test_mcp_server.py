@@ -874,6 +874,29 @@ class TestReadTools:
         assert tax["project"] == {"backend": 2, "frontend": 1}
         assert tax["notes"] == {"planning": 1}
 
+    def test_overview_tools_normalize_missing_wing_room_to_unknown(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """Fast path must keep the client path's contract: drawers missing
+        wing/room metadata read as 'unknown', not the sqlite COALESCE
+        placeholder '?' (#1748 review)."""
+        collection.add(
+            ids=["no_meta_drawer"],
+            documents=["a drawer with no wing or room metadata"],
+            metadatas=[{"source_file": "loose.txt"}],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+
+        tax = mcp_server.tool_get_taxonomy()["taxonomy"]
+        assert tax == {"unknown": {"unknown": 1}}
+
+        status = mcp_server.tool_status()
+        assert status["wings"] == {"unknown": 1}
+        assert status["rooms"] == {"unknown": 1}
+
     def test_no_palace_returns_error(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_status

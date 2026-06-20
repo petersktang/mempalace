@@ -990,10 +990,28 @@ def _sqlite_taxonomy():
     try:
         from .backends.chroma import _sqlite_wing_room_counts
 
-        return _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+        counts = _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
     except Exception:
         logger.debug("sqlite taxonomy fast path failed; falling back", exc_info=True)
         return None
+    if counts is None:
+        return None
+
+    # Preserve the client path's output contract: drawers missing wing/room
+    # read as "unknown" (the ``m.get("wing", "unknown")`` default), not the
+    # sqlite COALESCE placeholder "?". Without this, the fast path would be an
+    # observable API change for MCP clients on legacy/partial drawers.
+    def _norm(key):
+        return "unknown" if key in (None, "?") else key
+
+    total, wing_rooms = counts
+    normalized: dict = {}
+    for wing, room_counts in wing_rooms.items():
+        dest = normalized.setdefault(_norm(wing), {})
+        for room, n in room_counts.items():
+            rkey = _norm(room)
+            dest[rkey] = dest.get(rkey, 0) + n
+    return total, normalized
 
 
 def tool_status():

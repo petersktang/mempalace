@@ -176,7 +176,7 @@ def _build_ef_class():
             # still works.
             cap = getattr(self, "_intra_op_num_threads", 0)
             if not cap or cap <= 0:
-                return ONNXMiniLM_L6_V2.model.func(self)
+                return super().model
             try:
                 ort = self.ort
                 providers = self._preferred_providers or ort.get_available_providers()
@@ -195,7 +195,7 @@ def _build_ef_class():
                     "thread-capped ORT session build failed; using ORT defaults",
                     exc_info=True,
                 )
-                return ONNXMiniLM_L6_V2.model.func(self)
+                return super().model
 
     return _MempalaceONNX
 
