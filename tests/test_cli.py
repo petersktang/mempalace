@@ -1017,6 +1017,35 @@ def test_cmd_repair_error_reading(mock_config_cls, tmp_path, capsys):
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_error_reading_points_to_from_sqlite_not_remine(
+    mock_config_cls, tmp_path, capsys
+):
+    """When the drawer-index read fails (the chromadb HNSW compactor cannot
+    apply WAL logs to the segment), legacy repair must point the user at
+    ``repair --mode from-sqlite`` — the rows are intact in chroma.sqlite3 —
+    and must NOT advise re-mining from source files, which silently drops
+    drawers added via the MCP server and diary entries (#1843)."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None)
+    mock_col = MagicMock()
+    mock_col.count.side_effect = Exception(
+        "Error executing plan: Error sending backfill request to compactor: "
+        "Failed to apply logs to the hnsw segment writer"
+    )
+    mock_backend = MagicMock()
+    mock_backend.get_collection.return_value = mock_col
+    with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
+        cmd_repair(args)
+    out = capsys.readouterr().out
+    assert "mempalace repair --mode from-sqlite --archive-existing" in out
+    assert "may need to be re-mined" not in out
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_zero_drawers(mock_config_cls, tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()

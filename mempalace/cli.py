@@ -1076,6 +1076,7 @@ def cmd_repair(args):
         _post_rebuild_cleanup,
         _rebuild_collection_via_temp,
         check_extraction_safety,
+        index_read_recovery_guidance,
         maybe_repair_poisoned_max_seq_id_before_rebuild,
         print_sqlite_integrity_abort,
         sqlite_integrity_errors,
@@ -1189,7 +1190,7 @@ def cmd_repair(args):
         print(f"  Drawers found: {total}")
     except Exception as e:
         print(f"  Error reading palace: {e}")
-        print("  Cannot recover — palace may need to be re-mined from source files.")
+        print(index_read_recovery_guidance())
         return
 
     if total == 0:
